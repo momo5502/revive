@@ -96,10 +96,19 @@ covering extraction and every alias case; a worker is killed 30 seconds after
 that (`--worker-timeout`). All logical CPUs are used by default (`--jobs`),
 and a worker above `--memory-limit` (8 GiB) is killed. Exhausting a limit is
 `INCONCLUSIVE`. `--order random --seed N` samples reproducibly.
-Each function runs in a disposable child process so a native Z3 failure is
-recorded as `SOLVER_CRASH` without killing the campaign. Results are written
+Workers process one function at a time and recycle after 32 functions
+(`--tasks-per-worker`; use `1` to disable reuse). They retain bounded artifact
+and lifting caches, but every symbolic execution gets fresh state. A crash
+affects only the assigned function; timeouts and memory-limit failures kill
+and replace that worker. Per-function deadlines restart at task assignment.
+A native Z3 failure is recorded as `SOLVER_CRASH` without killing the campaign. Results are written
 atomically to `campaign/results.tsv`; generated campaign data is intentionally
 git-ignored.
+
+Keep input artifacts and verifier code unchanged while a campaign is running.
+File-backed caches check file identity, size and nanosecond timestamps on
+lookup, so normal rebuilds between classifications invalidate cached metadata;
+this is not a transactional snapshot of a concurrently changing build.
 
 ## Result statuses
 
@@ -131,8 +140,12 @@ Benchmark particular selectors without modifying campaign results:
   --repeat 3
 ```
 
-Each measurement uses a fresh worker. `--symbol` can be repeated; `--timeout`
+Each measurement uses a fresh worker by default. Add `--tasks-per-worker 32`
+to measure campaign-style reuse (repeat several different selectors together).
+`--symbol` can be repeated; `--timeout`
 sets the total function budget (default 60 seconds). JSON output includes the
 verdict, elapsed time, reasons, fingerprint, and median time per selector.
+The summary's `wall_seconds` also includes child startup and recycling;
+individual elapsed times do not. Use the wall time when comparing throughput.
 Artifact caches may be reused. See `HANDOFF.md` for profiling results and the
 limits of the current measurements.

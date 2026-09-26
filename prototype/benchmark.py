@@ -1,7 +1,8 @@
-"""Benchmark selected live functions in fresh, budgeted worker processes.
+"""Benchmark selected live functions in budgeted worker processes.
 
 Prints one JSON record per run without modifying campaign results. PDB disk
-caches may be reused, but every measurement starts a new verifier process.
+caches may be reused. By default every measurement starts a fresh verifier;
+--tasks-per-worker measures the reusable campaign workers instead.
 """
 
 from __future__ import annotations
@@ -22,11 +23,12 @@ def main() -> int:
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--symbol", action="append", required=True)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--tasks-per-worker", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--memory-limit", type=float, default=8.0, help="GiB per worker")
     args = parser.parse_args()
-    if args.repeat < 1 or args.timeout <= 0 or args.memory_limit <= 0:
-        parser.error("repeat, timeout and memory-limit must be positive")
+    if args.repeat < 1 or args.timeout <= 0 or args.memory_limit <= 0 or args.tasks_per_worker < 1:
+        parser.error("repeat, timeout, memory-limit and tasks-per-worker must be positive")
     paths = Paths(*(str(getattr(args, name).resolve())
                     for name in ("repository", "build", "pdb", "exe")))
     items = [
@@ -37,7 +39,8 @@ def main() -> int:
     started = time.monotonic()
     measurements: dict[str, list] = {}
     for result in _isolated_results(items, jobs=1,
-                                    memory_limit=int(args.memory_limit * (1 << 30))):
+                                    memory_limit=int(args.memory_limit * (1 << 30)),
+                                    tasks_per_worker=args.tasks_per_worker):
         measurements.setdefault(result.selector, []).append(result)
         print(json.dumps({"kind": "measurement", **asdict(result)}), flush=True)
     print(json.dumps({

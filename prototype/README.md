@@ -19,8 +19,14 @@ It is deliberately fail-closed: only `EQUIVALENT` is a reusable proof result.
   manipulation.
 - `EXACT_NOW`: campaign extraction produced byte-identical relocated code.
 - `EXTRACTION_FAILED`: PE/PDB/COFF identity construction failed before a proof.
-- `SOLVER_CRASH`: the disposable per-function process exited natively; the
+- `SOLVER_CRASH`: the isolated worker process exited natively; the
   coordinator records the selector and continues.
+
+Campaign workers reuse read-only artifact and project setup for up to 32
+functions (`--tasks-per-worker 1` restores one process per function). Execution
+states are never reused. Crashes, hard timeouts and memory-limit kills replace
+the worker and affect only its current task. See the root README for benchmarks
+and artifact-cache assumptions.
 
 `counterexample()` is retained for the experiments. It returns a witness or
 `None` only for conclusive results and raises `IncompleteVerification` for the

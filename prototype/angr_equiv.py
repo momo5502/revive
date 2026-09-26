@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 import gc
 import hashlib
 import itertools
@@ -930,6 +931,7 @@ UNSUPPORTED_X87_INSTRUCTIONS = {
 }
 
 
+@lru_cache(maxsize=128)
 def unsupported_instructions(code: bytes, base: int) -> tuple[str, ...]:
     engine = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     engine.detail = True
@@ -966,6 +968,70 @@ def unsupported_instructions(code: bytes, base: int) -> tuple[str, ...]:
     return tuple(dict.fromkeys(issues))
 
 
+@lru_cache(maxsize=8)
+def _prepared_project(code, base, calls, call_results, memory_regions):
+    """Reuse lifting and immutable hooks, never SimStates or solver results.
+
+    Hook configuration is part of the key: in particular, discovery can grow
+    memory_regions and two sides can have different callee ABIs/results.
+    Every execute() still creates a fresh call state and fresh inspectors.
+    """
+    proj = project(code, base)
+    if len(calls) != len(call_results):
+        raise ValueError("each call target needs a shared symbolic result")
+
+    _install_semantic_instruction_hooks(proj, code, base, memory_regions)
+    for target, result in zip(calls, call_results, strict=True):
+        if target.frontend_issues:
+            return None, target.frontend_issues
+        try:
+            if target.signature:
+                _prototype(proj, target.signature, target.argument_count)  # validates arity
+                homes = target.entry_homes or standard_parameter_homes(target.signature)
+                widths = tuple(item.size * 8 for item in target.signature.parameters)
+            else:
+                homes = word_homes((4,) * target.argument_count)
+                widths = ()
+            homes = _homes_with_varargs(homes, target.argument_count)
+            widths = (*widths, *(32,) * (len(homes) - len(widths)))
+            if any(home.registers and width > 32 for home, width in zip(homes, widths)):
+                raise ValueError("register parameter wider than 32 bits")
+            convention = (target.signature.calling_convention.lower()
+                          if target.signature else "nearc")
+            callee_cleanup = convention not in ("nearc", "cdecl", "nearvector")
+            target_cc = (angr.calling_conventions.SimCCStdcall(proj.arch) if callee_cleanup
+                         else angr.calling_conventions.SimCCMicrosoftCdecl(proj.arch))
+            word = SimTypeNum(32, signed=False).with_arch(proj.arch)
+            target_prototype = SimTypeFunction(
+                [word] * (_stack_bytes(homes, widths) // 4),
+                _sim_type(target.signature.return_type, proj.arch) if target.signature else word,
+            ).with_arch(proj.arch)
+        except ValueError as error:
+            return None, (f"UNSUPPORTED_CALL_ABI:{target.decorated_symbol}:{error}",)
+        pointer_mask = target.argument_pointer_mask or (
+            tuple(item.pointer for item in target.signature.parameters) +
+            tuple(False for _ in range(
+                target.argument_count - len(target.signature.parameters)
+            ))
+            if target.signature else ()
+        )
+        pointee_sizes = target.argument_pointee_sizes or (
+            tuple(item.pointee_size for item in target.signature.parameters) +
+            tuple(None for _ in range(
+                target.argument_count - len(target.signature.parameters)
+            ))
+            if target.signature else ()
+        )
+        proj.hook(target.address, RecordedCall(
+            target.decorated_symbol, result, target.argument_count,
+            target.argument_registers, target.fresh_result,
+            target.havoc_memory, memory_regions, target.return_register,
+            pointer_mask, pointee_sizes, target.callsite_argument_counts,
+            target.x87_pops, homes, widths, target_cc, target_prototype,
+        ))
+    return proj, ()
+
+
 def execute(
     code: bytes,
     arguments: tuple[claripy.ast.BV, ...],
@@ -992,66 +1058,10 @@ def execute(
     feature_issues = unsupported_instructions(code, base)
     if feature_issues:
         return Execution([], False, feature_issues, constraints, (), signature, stack_allocations)
-    proj = project(code, base)
-    if len(calls) != len(call_results):
-        raise ValueError("each call target needs a shared symbolic result")
-
     memory_regions = tuple((address, value.size() // 8) for address, value in initial_memory)
-    _install_semantic_instruction_hooks(proj, code, base, memory_regions)
-    for target, result in zip(calls, call_results, strict=True):
-        if target.frontend_issues:
-            return Execution(
-                [], False, target.frontend_issues, constraints, memory_regions,
-                signature, stack_allocations,
-            )
-        try:
-            if target.signature:
-                _prototype(proj, target.signature, target.argument_count)  # validates arity
-                homes = target.entry_homes or standard_parameter_homes(target.signature)
-                widths = tuple(item.size * 8 for item in target.signature.parameters)
-            else:
-                homes = word_homes((4,) * target.argument_count)
-                widths = ()
-            homes = _homes_with_varargs(homes, target.argument_count)
-            widths = (*widths, *(32,) * (len(homes) - len(widths)))
-            if any(home.registers and width > 32 for home, width in zip(homes, widths)):
-                raise ValueError("register parameter wider than 32 bits")
-            convention = (target.signature.calling_convention.lower()
-                          if target.signature else "nearc")
-            callee_cleanup = convention not in ("nearc", "cdecl", "nearvector")
-            target_cc = (angr.calling_conventions.SimCCStdcall(proj.arch) if callee_cleanup
-                         else angr.calling_conventions.SimCCMicrosoftCdecl(proj.arch))
-            word = SimTypeNum(32, signed=False).with_arch(proj.arch)
-            target_prototype = SimTypeFunction(
-                [word] * (_stack_bytes(homes, widths) // 4),
-                _sim_type(target.signature.return_type, proj.arch) if target.signature else word,
-            ).with_arch(proj.arch)
-        except ValueError as error:
-            return Execution(
-                [], False, (f"UNSUPPORTED_CALL_ABI:{target.decorated_symbol}:{error}",),
-                constraints, memory_regions, signature, stack_allocations,
-            )
-        pointer_mask = target.argument_pointer_mask or (
-            tuple(item.pointer for item in target.signature.parameters) +
-            tuple(False for _ in range(
-                target.argument_count - len(target.signature.parameters)
-            ))
-            if target.signature else ()
-        )
-        pointee_sizes = target.argument_pointee_sizes or (
-            tuple(item.pointee_size for item in target.signature.parameters) +
-            tuple(None for _ in range(
-                target.argument_count - len(target.signature.parameters)
-            ))
-            if target.signature else ()
-        )
-        proj.hook(target.address, RecordedCall(
-            target.decorated_symbol, result, target.argument_count,
-            target.argument_registers, target.fresh_result,
-            target.havoc_memory, memory_regions, target.return_register,
-            pointer_mask, pointee_sizes, target.callsite_argument_counts,
-            target.x87_pops, homes, widths, target_cc, target_prototype,
-        ))
+    proj, issues = _prepared_project(code, base, calls, call_results, memory_regions)
+    if issues:
+        return Execution([], False, issues, constraints, memory_regions, signature, stack_allocations)
 
     try:
         if signature:
@@ -2262,7 +2272,10 @@ def verify_under_pdb_aliasing(
             processed_cases += 1
             del executions, result
             if processed_cases % 8 == 0:
-                gc.collect()
+                # Collect young execution cycles frequently, but avoid walking
+                # the entire PDB/angr object graph every eight alias cases.
+                # Workers still have hard memory limits and periodic recycling.
+                gc.collect(2 if processed_cases % 128 == 0 else 0)
         if not restart:
             return incomplete or VerificationResult(VerificationStatus.EQUIVALENT)
 

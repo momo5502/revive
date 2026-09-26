@@ -16,6 +16,7 @@ SCHEMA_VERSION = 2
 MODEL_VERSION = "angr-relational-v3"
 TOOL_PACKAGES = ("angr", "claripy", "pyvex", "z3-solver", "capstone")
 IMPLEMENTATION_FILES = (
+    "artifact_cache.py",
     "alias_model.py",
     "angr_equiv.py",
     "campaign.py",

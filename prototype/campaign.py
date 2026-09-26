@@ -6,7 +6,6 @@ import argparse
 import csv
 import ctypes
 from dataclasses import dataclass
-import functools
 import hashlib
 import json
 import logging
@@ -34,6 +33,7 @@ from live_extract import (
     type_placements,
 )
 from proof_record import proof_fingerprint
+from artifact_cache import file_sha256 as _file_sha256
 
 
 TERMINAL = {
@@ -173,15 +173,6 @@ def _write_results(path: Path, results: dict[str, WorkResult]) -> None:
 
 def _argument(name: str, size: int) -> claripy.ast.BV:
     return claripy.BVS(name, size * 8, explicit_name=True)
-
-
-@functools.lru_cache(maxsize=None)
-def _file_sha256(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _frontend_identity(paths: Paths, matcher) -> dict[str, str]:
@@ -388,10 +379,15 @@ def _classify(item: WorkItem) -> WorkResult:
     return finish(result.status.value, fingerprint, result.reasons, result.counterexample)
 
 
-def _isolated_entry(item: WorkItem, connection: Any) -> None:
-    """Run one classification behind a native-process failure boundary."""
+def _isolated_entry(item: WorkItem, connection: Any, classify=None) -> None:
+    """A worker handles one task at a time; only immutable setup is reused."""
+    classify = classify or _classify
     try:
-        connection.send(_classify(item))
+        while item is not None:
+            connection.send(classify(item))
+            item = connection.recv()
+    except EOFError:
+        pass
     finally:
         connection.close()
 
@@ -445,86 +441,125 @@ def _process_memory(pid: int) -> int | None:
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
-def _isolated_results(items: list[WorkItem], jobs: int, memory_limit: int | None = None):
-    """Yield results while allowing a native crash to affect only one item.
+def _isolated_results(items: list[WorkItem], jobs: int, memory_limit: int | None = None,
+                      tasks_per_worker: int = 32, *, _classify_function=None):
+    """Bounded reusable workers with per-task crash, timeout and memory limits.
 
-    A worker that exceeds ``memory_limit`` bytes is killed and reported as
-    INCONCLUSIVE. New workers start only while at least that much physical
-    memory is free, so every core is used when memory allows it.
+    No task is queued inside a worker. After a crash/kill only its assigned
+    task fails; remaining tasks go to replacements. Closing the generator
+    also terminates all outstanding workers. Set tasks_per_worker=1 for
+    cold-process measurements or strongest lifetime isolation.
     """
+    if jobs < 1 or tasks_per_worker < 1:
+        raise ValueError("jobs and tasks_per_worker must be positive")
     context = multiprocessing.get_context("spawn")
     remaining = iter(items)
-    active: dict[Any, tuple[WorkItem, Any, float]] = {}
+    active: dict[Any, tuple[WorkItem, Any, float, int]] = {}
     exhausted = False
 
-    def stop(process, item, connection, started, reason):
-        process.terminate()
+    def retire(process, connection, graceful=False):
+        if graceful and process.is_alive():
+            try:
+                connection.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
         process.join()
         connection.close()
         del active[process]
+        process.close()
+
+    def stop(process, item, connection, started, reason):
+        retire(process, connection)
         return WorkResult(
             item.selector, VerificationStatus.INCONCLUSIVE.value, None, (reason,), None,
             time.monotonic() - started,
         )
 
-    while active or not exhausted:
-        while not exhausted and len(active) < jobs:
-            available = _available_memory()
-            if (active and memory_limit is not None and available is not None and
-                    available < memory_limit):
-                break
-            try:
-                item = next(remaining)
-            except StopIteration:
-                exhausted = True
-                break
-            parent, child = context.Pipe(duplex=False)
-            process = context.Process(target=_isolated_entry, args=(item, child))
-            process.start()
-            child.close()
-            active[process] = (item, parent, time.monotonic())
-
-        made_progress = False
-        for process, (item, connection, started) in list(active.items()):
-            result = None
-            if connection.poll():
+    try:
+        while active or not exhausted:
+            while not exhausted and len(active) < jobs:
+                available = _available_memory()
+                if (active and memory_limit is not None and available is not None and
+                        available < memory_limit):
+                    break
                 try:
-                    result = connection.recv()
-                except EOFError:
-                    pass
-            elif process.is_alive():
+                    item = next(remaining)
+                except StopIteration:
+                    exhausted = True
+                    break
+                parent, child = context.Pipe(duplex=True)
+                process = context.Process(target=_isolated_entry,
+                                          args=(item, child, _classify_function))
+                process.start()
+                child.close()
+                active[process] = (item, parent, time.monotonic(), 1)
+
+            made_progress = False
+            for process, (item, connection, started, count) in list(active.items()):
+                result = None
+                try:
+                    ready = connection.poll()
+                except (EOFError, OSError):
+                    # Windows duplex named pipes can raise on poll itself
+                    # after a native worker crash, not only on recv.
+                    ready = True
+                if ready:
+                    try:
+                        result = connection.recv()
+                    except (EOFError, OSError):
+                        pass
+                elif process.is_alive():
+                    used = _process_memory(process.pid) if memory_limit is not None else None
+                    if used is not None and used > memory_limit:
+                        made_progress = True
+                        yield stop(process, item, connection, started,
+                                   f"MEMORY_LIMIT:{used >> 20}MB")
+                    elif (item.worker_timeout is not None and
+                            time.monotonic() - started > item.worker_timeout):
+                        made_progress = True
+                        yield stop(process, item, connection, started,
+                                   f"WORKER_TIMEOUT:{item.worker_timeout:g}s")
+                    continue
+
+                made_progress = True
+                if result is None:
+                    process.join(timeout=1)
+                    result = WorkResult(
+                        item.selector, "SOLVER_CRASH", None,
+                        (f"WORKER_EXIT_CODE:{process.exitcode}",), None,
+                        time.monotonic() - started,
+                    )
                 used = _process_memory(process.pid) if memory_limit is not None else None
-                if used is not None and used > memory_limit:
-                    made_progress = True
-                    yield stop(process, item, connection, started,
-                               f"MEMORY_LIMIT:{used >> 20}MB")
-                elif (item.worker_timeout is not None and
-                        time.monotonic() - started > item.worker_timeout):
-                    made_progress = True
-                    yield stop(process, item, connection, started,
-                               f"WORKER_TIMEOUT:{item.worker_timeout:g}s")
-                continue
+                reuse = (count < tasks_per_worker and process.is_alive() and
+                         (result.cached or result.status not in ("SOLVER_CRASH", "INCONCLUSIVE")) and
+                         (memory_limit is None or used is None or used < memory_limit))
+                next_item = None
+                if reuse and not exhausted:
+                    try:
+                        next_item = next(remaining)
+                    except StopIteration:
+                        exhausted = True
+                if next_item is None:
+                    retire(process, connection, graceful=True)
+                else:
+                    # Charge the new task from assignment, not worker birth.
+                    active[process] = (next_item, connection, time.monotonic(), count + 1)
+                    try:
+                        connection.send(next_item)
+                    except (BrokenPipeError, EOFError, OSError):
+                        # It died between the liveness check and dispatch. The
+                        # next iteration reports that assigned task as crashed.
+                        pass
+                yield result
 
-            process.join()
-            if result is None and connection.poll():
-                try:
-                    result = connection.recv()
-                except EOFError:
-                    pass
-            connection.close()
-            del active[process]
-            made_progress = True
-
-            if result is None:
-                result = WorkResult(
-                    item.selector, "SOLVER_CRASH", None,
-                    (f"WORKER_EXIT_CODE:{process.exitcode}",), None,
-                    time.monotonic() - started,
-                )
-            yield result
-
-        if active and not made_progress:
-            time.sleep(0.2)
+            if active and not made_progress:
+                time.sleep(0.05)
+    finally:
+        for process, (_, connection, _, _) in list(active.items()):
+            retire(process, connection)
 
 
 def _summary(results: dict[str, WorkResult]) -> dict[str, int]:
@@ -569,7 +604,8 @@ def run_campaign(args: argparse.Namespace) -> int:
         results[selector].fingerprint if selector in results else None,
     ) for selector in selectors]
     completed = 0
-    for result in _isolated_results(items, args.jobs, int(args.memory_limit * (1 << 30))):
+    for result in _isolated_results(items, args.jobs, int(args.memory_limit * (1 << 30)),
+                                    args.tasks_per_worker):
         if not result.cached:
             results[result.selector] = result
             _write_results(args.results, results)
@@ -596,6 +632,8 @@ def main() -> int:
     run.add_argument("--exe", type=Path, required=True)
     run.add_argument("--results", type=Path)
     run.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    run.add_argument("--tasks-per-worker", type=int, default=32,
+                     help="recycle each worker after this many functions (1 disables reuse)")
     run.add_argument(
         "--memory-limit", type=float, default=8.0,
         help="GiB per worker; larger workers are killed (INCONCLUSIVE) and new "
@@ -619,6 +657,8 @@ def main() -> int:
     )
     run.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
+    if args.command == "run" and (args.jobs < 1 or args.tasks_per_worker < 1):
+        parser.error("jobs and tasks-per-worker must be positive")
     args.repository = args.repository.resolve()
     args.output = args.output.resolve()
     if args.command == "split":

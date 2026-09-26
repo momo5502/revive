@@ -10,12 +10,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
 import os
 from pathlib import Path
 import pickle
 import re
 import subprocess
 from typing import Any
+
+from artifact_cache import file_identity
 
 
 PROCEDURE_LINE = re.compile(r"^\s*(\d+)\s+\|\s+S_[GL]PROC32(?:_ID)?\b")
@@ -69,20 +72,26 @@ CACHE_DIRECTORY = Path(
 )
 
 
-@lru_cache(maxsize=8)
 def _type_database(tool: str, pdb: str):
+    import artifact_matcher as matcher
+    return _cached_type_database(tool, pdb, file_identity(tool), file_identity(pdb),
+                                 file_identity(matcher.__file__))
+
+
+@lru_cache(maxsize=8)
+def _cached_type_database(tool: str, pdb: str, tool_id: tuple, pdb_id: tuple, matcher_id: tuple):
     """The matcher's TypeDB for a PDB, parsed once and cached on disk.
 
     Parsing a PDB's type stream from llvm-pdbutil output takes 10-20 s and
-    every worker needs both PDBs. The pickle is keyed by the PDB's path, size
-    and modification time, so a rebuilt candidate PDB is parsed again.
+    every worker needs both PDBs. The pickle is keyed by the identities of
+    the PDB, parser and tool (paths and file revisions), so rebuilt/replaced
+    inputs cannot reuse an older database in a persistent worker.
     """
     # Imported lazily so this module remains usable with any matcher exposing
     # the same TypeDB/dump_tpi API.
     import artifact_matcher as matcher
 
-    status = os.stat(pdb)
-    key = f"{Path(pdb).stem}-{status.st_size:x}-{status.st_mtime_ns:x}"
+    key = hashlib.sha256(repr((tool_id, pdb_id, matcher_id)).encode()).hexdigest()
     cache = CACHE_DIRECTORY / f"types-{key}.pickle"
     try:
         with cache.open("rb") as stream:
@@ -110,8 +119,12 @@ def normalized_path(value: str | Path) -> str:
     return os.path.normcase(os.path.abspath(str(value)))
 
 
-@lru_cache(maxsize=128)
 def _module_symbols(tool: str, pdb: str, module: int) -> str:
+    return _cached_module_symbols(tool, pdb, module, file_identity(tool), file_identity(pdb))
+
+
+@lru_cache(maxsize=128)
+def _cached_module_symbols(tool: str, pdb: str, module: int, tool_id: tuple, pdb_id: tuple) -> str:
     result = subprocess.run(
         [tool, "dump", "--symbols", f"--modi={module}", pdb],
         capture_output=True, text=True, encoding="utf-8", errors="replace",

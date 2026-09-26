@@ -429,6 +429,88 @@ enumeration remain significant costs.
 workers, with worker timeout/memory limits, and prints JSON without writing
 campaign results. Repeatable command examples are in the root README.
 
+### Setup and worker reuse (2026-09-26)
+
+The one-function path-pruning improvement above was not representative of
+campaign throughput. Follow-up profiles found repeated artifact parsing,
+process startup, execution setup, and full garbage collections to be material
+costs even in small functions. The vector-copy sample performed 90 executions
+across its alias cases; this change retains all those cases.
+
+Implemented:
+
+- Campaign workers handle one assigned function at a time, reuse setup for up
+  to 32 functions, then recycle (`--tasks-per-worker 1` restores fresh workers).
+  Deadlines reset on assignment. Native crashes, hard timeouts and memory-limit
+  kills affect only the assigned task; replacements handle remaining work.
+  Non-cached `INCONCLUSIVE` results also retire their worker. Closing the result
+  generator terminates its children. Windows broken pipes can raise during
+  `poll()` as well as `recv()`; both paths are handled.
+- `artifact_cache.py` provides bounded read-through metadata and file-hash
+  caches. Inventories, globals, PE images, COFF objects, public maps, and data
+  owners are reused. Candidate procedure indexes follow inventory identity,
+  rather than only a PDB pathname. PDB symbol/type caches also invalidate on
+  input changes. The old path-only COFF/Ninja caches are unwrapped and replaced
+  with file-revision-aware caches. Type-database disk cache keys now include
+  PDB, tool and parser identity (existing old-format entries are not reused).
+- Leaf functions skip building call-symbol indexes; other functions reuse
+  indexes for the same inventory/image.
+- Eight prepared angr projects are cached per process, keyed by code bytes,
+  base, complete call contracts/results, and declared memory regions. They
+  retain lifted blocks and hook setup. Every execution still creates a fresh
+  state, memory, solver constraints, pointer model and inspection callbacks.
+  Unsupported-instruction scans are cached separately by bytes/base.
+- Explicit GC every eight alias cases now scans the youngest generation;
+  every 128 cases still requests a full collection. Automatic GC and worker
+  memory limits remain active.
+
+No alias cases or proof obligations were removed. Verdict-cache lookup still
+follows extraction/fingerprinting; sharing symbolic execution summaries across
+different alias cases and avoiding discovery restarts remain future work.
+The implementation fingerprint includes the new cache module, invalidating
+old conclusions automatically. No campaign was started, and existing result
+files were left untouched.
+
+Cache assumptions: artifacts are immutable during each classification, and
+verifier code is immutable during a campaign. Lookups check normalized path,
+device/file identity, size, mtime_ns and ctime_ns; a normal rebuild/replacement
+invalidates entries. This does not provide a transactional snapshot of a live
+build or detect edits that deliberately preserve all tracked metadata. Cached
+parsed objects are read-only to consumers. Use fresh workers when diagnosing
+cache behavior.
+
+Validation: 86 tests pass with
+`.venv\Scripts\python.exe -m unittest discover -s prototype -p 'test_*.py' -q`.
+The 16 new tests cover bounded/file-invalidating caches, PDB/index invalidation,
+matcher module identity, fresh execution state with reused projects, complete
+project keys, worker reuse/recycling, crashes, hard timeouts, memory kills,
+parallel delivery, and cancellation cleanup.
+
+Measurements on the same live artifacts, single-worker sequential execution,
+60-second function budgets, two passes through three selectors, with PDB disk
+caches already populated:
+
+| Configuration | Six-task wall time (includes child startup) |
+| --- | ---: |
+| `e6586e5`, original fresh workers | 71.92 s |
+| Updated code, `--tasks-per-worker 1` | 59.16 s |
+| Updated code, `--tasks-per-worker 32` | 40.20 s |
+
+| Selector | Original median | Updated fresh median | Updated reuse median |
+| --- | ---: | ---: | ---: |
+| `?IWNet_HandleSessionUpdateFailure@@YA_NPAUIWNetCommandData@@PAUmsg_t@@@Z` | 3.93 s | 2.63 s | 2.03 s |
+| `@physics/ode/src/ode.cpp:0x2dbd00:0x1c58` | 10.56 s | 7.96 s | 6.90 s |
+| `?CG_GetShellShockBlendTime@@YAHH@Z` | 11.97 s | 10.09 s | 9.48 s |
+
+Every measurement was a fresh proof (`cached=false`), and every verdict was
+`EQUIVALENT`. The two updated configurations produced identical fingerprints
+per selector. Individual times exclude process startup; reuse medians mix
+worker-cold and worker-warm tasks. Reproduce with `prototype/benchmark.py`, the
+three repeated `--symbol` options above, `--repeat 2`, and
+`--tasks-per-worker 1` or `32`. Updated reuse reduced measured wall time by
+44% (about 1.79x throughput) for this sample, not a corpus-wide guarantee.
+Hard loop/solver-bound functions can still exhaust their unchanged budget.
+
 ### Remaining limitations
 
 1. **Pointer following limits.** Derived pointers are capped at 6 per

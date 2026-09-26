@@ -18,6 +18,7 @@ import sys
 
 import capstone
 
+from artifact_cache import artifact_memoize, file_identity, file_sha256
 from pdb_frontend import (
     ABISignature, ABIType, extract_function_metadata, normalized_path,
     recorded_parameter_homes, type_database,
@@ -308,6 +309,21 @@ def _direct_calls(code: bytes, base: int) -> list[tuple[int, int, int | None]]:
     return result
 
 
+@artifact_memoize()
+def _call_symbol_indexes(matcher, inventory, pe):
+    _, public_by_name = matcher.public_maps(inventory, pe)
+    publics_by_target: dict[int, list[str]] = {}
+    for name, rva in public_by_name.items():
+        publics_by_target.setdefault(pe.image_base + rva, []).append(name)
+    procedures_by_target: dict[int, list[str]] = {}
+    for procedure in inventory.get("procedures", ()):
+        name = procedure.get("name")
+        if name:
+            target = pe.image_base + pe.rva(procedure["section"], procedure["offset"])
+            procedures_by_target.setdefault(target, []).append(name)
+    return publics_by_target, procedures_by_target
+
+
 def external_call_contracts(pair: dict):
     """PDB-typed summaries for every direct call leaving the function.
 
@@ -317,6 +333,8 @@ def external_call_contracts(pair: dict):
     base = pair["address"]
     reference_calls = _direct_calls(pair["reference"], base)
     candidate_calls = _direct_calls(pair["candidate"], base)
+    if not reference_calls and not candidate_calls:
+        return (), ()
 
     symbol_by_target: dict[int, str] = {}
     for relocation in pair["relocation_resolutions"]:
@@ -327,19 +345,9 @@ def external_call_contracts(pair: dict):
         if match and relocation.get("target"):
             symbol_by_target[match[1]] = relocation["target"]
 
-    _, public_by_name = pair["matcher"].public_maps(pair["inventory"], pair["pe"])
-    publics_by_target: dict[int, list[str]] = {}
-    for name, rva in public_by_name.items():
-        publics_by_target.setdefault(pair["pe"].image_base + rva, []).append(name)
-    procedures_by_target: dict[int, list[str]] = {}
-    for procedure in pair["inventory"].get("procedures", ()):
-        name = procedure.get("name")
-        if not name:
-            continue
-        target = pair["pe"].image_base + pair["pe"].rva(
-            procedure["section"], procedure["offset"],
-        )
-        procedures_by_target.setdefault(target, []).append(name)
+    publics_by_target, procedures_by_target = _call_symbol_indexes(
+        pair["matcher"], pair["inventory"], pair["pe"],
+    )
 
     calls_by_target: dict[int, list[tuple[int, int | None]]] = {}
     # A call is internal only when it lands inside the calling side's own
@@ -701,28 +709,25 @@ def type_placements(pair: dict):
     return placements
 
 
-_CANDIDATE_INDEXES: dict[str, dict] = {}
-
-
 def _candidate_procedure_index(pair: dict) -> dict:
     """Candidate PDB procedures grouped by object and public symbol, built
     once per process (path normalization per record was the dominant cost)."""
     candidate_pdb = candidate_pdb_path(pair["build"])
-    key = normalized_path(candidate_pdb)
-    if key not in _CANDIDATE_INDEXES:
-        inventory = pair["matcher"].load_inventory(
-            pair["build"], candidate_pdb, pair["tool"], False,
-        )
-        by_object: dict[str, list[dict]] = {}
-        by_public: dict[str, list[dict]] = {}
-        for item in inventory.get("procedures", ()):
-            by_object.setdefault(normalized_path(item.get("object") or ""), []).append(item)
-            for symbol in item.get("public_symbols") or ():
-                by_public.setdefault(symbol, []).append(item)
-        _CANDIDATE_INDEXES[key] = {
-            "inventory": inventory, "by_object": by_object, "by_public": by_public,
-        }
-    return _CANDIDATE_INDEXES[key]
+    inventory = pair["matcher"].load_inventory(
+        pair["build"], candidate_pdb, pair["tool"], False,
+    )
+    return _index_candidate_inventory(inventory)
+
+
+@artifact_memoize()
+def _index_candidate_inventory(inventory):
+    by_object: dict[str, list[dict]] = {}
+    by_public: dict[str, list[dict]] = {}
+    for item in inventory.get("procedures", ()):
+        by_object.setdefault(normalized_path(item.get("object") or ""), []).append(item)
+        for symbol in item.get("public_symbols") or ():
+            by_public.setdefault(symbol, []).append(item)
+    return {"inventory": inventory, "by_object": by_object, "by_public": by_public}
 
 
 def pointer_field_types(pair: dict):
@@ -880,14 +885,38 @@ def pointer_global_contracts(pair: dict) -> tuple[PointerGlobalContract, ...]:
 
 
 def load_matcher(repository: Path):
+    module = _cached_matcher(repository)
+    # TypeDB pickle loading imports this name, including on cache hits after
+    # another repository's adapter was loaded in the same process.
+    sys.modules["artifact_matcher"] = module
+    return module
+
+
+@artifact_memoize(maxsize=2, dependencies=lambda repository: file_identity(
+    repository / "tools" / "byte_match" / "iw4match.py"))
+def _cached_matcher(repository: Path):
     tools = repository / "tools" / "byte_match"
-    sys.path.insert(0, str(tools))
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
     spec = importlib.util.spec_from_file_location("artifact_matcher", tools / "iw4match.py")
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load matcher module")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # Reuse read-only metadata, not function verdicts. Unwrap the matcher's
+    # path-only caches so rebuilt objects/graphs cannot remain stale in a
+    # long-lived worker.
+    module.sha256 = file_sha256
+    for name in ("load_inventory", "load_globals", "load_target_data_owners",
+                 "load_target_data_rvas", "load_target_function_rvas", "public_maps",
+                 "PEImage", "canonical_object"):
+        function = getattr(module, name)
+        function = getattr(function, "__wrapped__", function)
+        setattr(module, name, artifact_memoize()(function))
+    module.ninja_outputs = artifact_memoize(
+        dependencies=lambda build: file_identity(build / "build.ninja"),
+    )(module.ninja_outputs.__wrapped__)
     return module
 
 
