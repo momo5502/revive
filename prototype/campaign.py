@@ -357,7 +357,11 @@ def _classify(item: WorkItem) -> WorkResult:
             },
             # One budget for every alias case of the function; running out
             # is INCONCLUSIVE (ALIAS_CAMPAIGN_TIMEOUT).
-            total_timeout_seconds=item.function_timeout,
+            # The budget covers the whole function, extraction included.
+            total_timeout_seconds=(
+                max(0.001, item.function_timeout - (time.monotonic() - started))
+                if item.function_timeout is not None else None
+            ),
             reference_stack_allocations=reference_allocations,
             candidate_stack_allocations=candidate_allocations,
             placements=placements,
@@ -606,12 +610,12 @@ def main() -> int:
     run.add_argument("--maximum-alias-cases", type=int, default=4096)
     run.add_argument(
         "--function-timeout", type=float, default=60.0,
-        help="verification budget per function across all alias cases",
+        help="total budget per function (extraction and every alias case)",
     )
     run.add_argument(
         "--worker-timeout", type=float,
-        help="hard kill per function (default: function timeout plus 120 s for "
-             "extraction and a solver query that overruns the budget)",
+        help="hard kill per function (default: function timeout plus 30 s for "
+             "a solver query that overruns the budget)",
     )
     run.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
@@ -625,7 +629,7 @@ def main() -> int:
         return 0
     args.results = (args.results or args.output / "results.tsv").resolve()
     if args.worker_timeout is None:
-        args.worker_timeout = args.function_timeout + 120.0
+        args.worker_timeout = args.function_timeout + 30.0
     if args.order == "random" and args.seed is None:
         args.seed = random.SystemRandom().randrange(1 << 32)
         print(json.dumps({"seed": args.seed}), flush=True)

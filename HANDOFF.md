@@ -348,14 +348,30 @@ confirmed defect has a regression test in `ReviewRegressionTests`
   placements); typed ones follow the C++ object model. Out-of-range FPTAN
   pushes nothing.
 
-Sample, 20 random inexact functions (seed 1246938500), 12 workers, 60 s per
-function, 3.5 minutes wall clock: 1 `EQUIVALENT`, 4 `NOT_EQUIVALENT`
+- **Third review (three unsound EQUIVALENT paths), each with a test.**
+  Fresh objects now have symbolic base addresses (non-null, no wrap, no
+  overlap with each other, referenced globals, the stack or code); memory
+  accesses through them are mapped to canonical storage in the memory
+  breakpoints, adding no path constraint, so address bits stay symbolic and
+  allocation-order cases are no longer needed. Accesses past an object's
+  modeled extent widen it (dropping its PDB type) and restart the
+  enumeration; an arena access no object can own is `MODEL_INCOMPLETE`
+  (`POINTEE_ACCESS_OUT_OF_RANGE`, `POINTEE_EXTENT_LIMIT`). Stores of any width
+  are scanned for private stack addresses.
+- **Budget.** `--function-timeout` (60 s) now covers extraction and all alias
+  cases, and final solver queries get the remaining time (`SOLVER_TIMEOUT`);
+  workers are killed 30 s after the budget.
+
+Sample, 20 random inexact functions (seed 1246938500), 12 workers, 60 s total
+per function, 2.4 minutes wall clock: 1 `EQUIVALENT`, 4 `NOT_EQUIVALENT`
 (signature mismatches, assert `__FILE__`/`__LINE__` arguments, a raw instead
-of normalized `bool` return, a literal read through a mutable pointer global;
-each checked against the disassembly), 3 `MODEL_INCOMPLETE`, 11
-`INCONCLUSIVE` (budget, loops, recursion), 1 `UNSUPPORTED`. Open engine
-errors from that sample: an IR decode error in an `fx_marks` function and a
-"no bytes in memory" jump in `CL_GetLocalClientMigrationString`.
+of normalized `bool` return; checked against the disassembly), 5
+`MODEL_INCOMPLETE` (derived-pointer limit, out-of-range pointee accesses,
+no returning state), 9 `INCONCLUSIVE` (budget: loops, recursion, large
+functions, one 60 s solver timeout), 1 `UNSUPPORTED`. `CG_GetShellShockBlendTime`
+proves `EQUIVALENT` in about 62 s with a larger budget. Open engine errors:
+an IR decode error in an `fx_marks` function and a "no bytes in memory" jump
+in `CL_GetLocalClientMigrationString`.
 
 ## Known issues and open work
 

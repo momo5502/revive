@@ -21,6 +21,7 @@ import time
 import angr
 import capstone
 import claripy
+from claripy.algorithm import replace_dict
 from angr.sim_type import (
     SimTypeBottom,
     SimTypeDouble,
@@ -254,8 +255,8 @@ def _materialize_lazy(state: angr.SimState, address: int, length: int) -> None:
             if value is None or any(start + index in live for index in range(4)):
                 continue
             state.memory.store(
-                start, claripy.BVV(value, 32), endness=state.arch.memory_endness,
-                inspect=False, disable_actions=True,
+                start, value if isinstance(value, claripy.ast.BV) else claripy.BVV(value, 32),
+                endness=state.arch.memory_endness, inspect=False, disable_actions=True,
             )
             injected.update(range(start, start + 4))
         if injected:
@@ -478,7 +479,7 @@ class RecordedCall(angr.SimProcedure):
             x87_pop(self.state)
         modeled = (self.state.globals.get("pointer_returns") or {}).get((ordinal, digest))
         if modeled is not None and self.result.size() == 32:
-            result = claripy.BVV(modeled, 32)
+            result = modeled if isinstance(modeled, claripy.ast.BV) else claripy.BVV(modeled, 32)
         elif self.fresh_result:
             result = claripy.BVS(
                 f"external_return_{ordinal}_{digest}", self.result.size(),
@@ -561,9 +562,9 @@ def pointer_source(state: angr.SimState, address: claripy.ast.BV) -> tuple | Non
     if returns:
         return next(iter(returns))
     epoch, slot = candidates[0]
-    for key, start, size in state.globals.get("pointer_layout", ()):
-        if start <= slot < start + size:
-            return ("slot", ("entity", key), slot - start, epoch)
+    for key, pointer, low, high in state.globals.get("pointer_layout", ()):
+        if pointer + low <= slot < pointer + high:
+            return ("slot", ("entity", key), slot - pointer, epoch)
     return ("slot", ("global",), slot, epoch)
 
 
@@ -984,6 +985,7 @@ def execute(
     pointer_slots: dict[tuple[int, int], int] | None = None,
     pointer_returns: dict[tuple[int, str], int] | None = None,
     pointer_layout: tuple[tuple[tuple, int, int], ...] = (),
+    address_map: tuple[tuple[claripy.ast.BV, int], ...] = (),
 ) -> Execution:
     if frontend_issues:
         return Execution([], False, frontend_issues, constraints, (), signature, stack_allocations)
@@ -1210,6 +1212,13 @@ def execute(
     state.globals["pointer_slots"] = dict(pointer_slots or {})
     state.globals["pointer_returns"] = dict(pointer_returns or {})
     state.globals["pointer_layout"] = tuple(pointer_layout)
+    # Symbolic fresh-object bases -> canonical storage addresses.
+    state.globals["address_map"] = {
+        symbol.hash(): claripy.BVV(canonical, 32) for symbol, canonical in address_map
+    }
+    state.globals["address_map_names"] = frozenset(
+        name for symbol, _ in address_map for name in symbol.variables
+    )
     state.memory.read_strategies = [
         angr.concretization_strategies.SimConcretizationStrategyRange(1024),
         _RejectUnboundedAddress(),
@@ -1219,9 +1228,25 @@ def execute(
         _RejectUnboundedAddress(),
     ]
 
+    def canonical_address(current: angr.SimState, address):
+        """Map an address built on symbolic object bases to its storage.
+
+        Pointer values keep their symbolic bases (so arithmetic on them is not
+        fixed), while the bytes live at a canonical concrete address. Mapping
+        the access here, before angr concretizes, adds no path constraint.
+        """
+        names = current.globals.get("address_map_names")
+        if (not names or address is None or getattr(address, "concrete", True) or
+                not address.variables & names):
+            return address
+        return replace_dict(address, current.globals["address_map"])
+
     def record_read(current: angr.SimState) -> None:
         address = current.inspect.attrs.mem_read_address
         length = current.inspect.attrs.mem_read_length
+        mapped = canonical_address(current, address)
+        if mapped is not address:
+            current.inspect.attrs.mem_read_address = address = mapped
         if address is not None and length is not None:
             size = _as_length(length)
             if getattr(address, "concrete", False) and size is not None:
@@ -1235,6 +1260,9 @@ def execute(
             return
         address = current.inspect.attrs.mem_write_address
         length = current.inspect.attrs.mem_write_length
+        mapped = canonical_address(current, address)
+        if mapped is not address:
+            current.inspect.attrs.mem_write_address = address = mapped
         if address is not None and length is not None:
             size = _as_length(length)
             if getattr(address, "concrete", False) and size is not None:
@@ -1246,12 +1274,24 @@ def execute(
             low, high = _private_stack(current)
             external = not getattr(address, "concrete", False) or not (
                 low <= address.concrete_value < high)
-            if external and stored is not None and stored.size() == 32:
-                root = (f"store@{address.concrete_value:x}"
-                        if getattr(address, "concrete", False) else "store@symbolic")
-                region = _stack_escape(current, stored, root)
-                if region is not None:
-                    _add_escape(current, region)
+            if external and stored is not None and stored.size() >= 32:
+                # Any 4-byte window of a store of any width (aggregate and
+                # vector copies included) may carry a stack address.
+                little = current.inspect.attrs.mem_write_endness != "Iend_BE"
+                width = stored.size() // 8
+                for byte in range(width - 3):
+                    if little:
+                        word = stored[8 * (byte + 4) - 1:8 * byte]
+                    else:
+                        top = stored.size() - 8 * byte
+                        word = stored[top - 1:top - 32]
+                    if not _may_address_stack(current, word):
+                        continue
+                    root = (f"store@{address.concrete_value + byte:x}"
+                            if getattr(address, "concrete", False) else f"store@symbolic+{byte}")
+                    region = _stack_escape(current, word, root)
+                    if region is not None:
+                        _add_escape(current, region)
             current.globals["memory_writes"] = (
                 (address, length), current.globals.get("memory_writes"),
             )
@@ -1640,7 +1680,38 @@ def verify_equivalence(
     return_register: str = "auto",
     return_pointer: bool = False,
     pointer_observations: tuple[tuple[int, int], ...] = (),
+    deadline: float | None = None,
 ) -> VerificationResult:
+    try:
+        return _verify_equivalence(
+            reference, candidate, inputs, observed_memory, return_bits, compare_return,
+            return_register, return_pointer, pointer_observations, deadline,
+        )
+    except claripy.errors.ClaripySolverInterruptError:
+        return VerificationResult(VerificationStatus.INCONCLUSIVE, reasons=("SOLVER_TIMEOUT",))
+
+
+def _verify_equivalence(
+    reference: Execution,
+    candidate: Execution,
+    inputs: tuple[claripy.ast.BV, ...],
+    observed_memory: tuple[tuple[int, int], ...],
+    return_bits: int,
+    compare_return: bool,
+    return_register: str,
+    return_pointer: bool,
+    pointer_observations: tuple[tuple[int, int], ...],
+    deadline: float | None,
+) -> VerificationResult:
+    def new_solver() -> claripy.Solver:
+        """A solver limited to the time left in the function's budget."""
+        if deadline is None:
+            return claripy.Solver()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise claripy.errors.ClaripySolverInterruptError("budget exhausted")
+        return claripy.Solver(timeout=max(1, int(remaining * 1000)))
+
     execution_issues = tuple((*reference.issues, *candidate.issues))
     if not reference.complete or not candidate.complete:
         if any(reason.startswith("UNSUPPORTED_") for reason in execution_issues):
@@ -1691,7 +1762,7 @@ def verify_equivalence(
     )
     reference_coverage = _or([path_condition(state) for state in reference.states])
     candidate_coverage = _or([path_condition(state) for state in candidate.states])
-    coverage_solver = claripy.Solver()
+    coverage_solver = new_solver()
     coverage_solver.add(claripy.And(
         assumptions, reference_coverage != candidate_coverage,
     ))
@@ -1701,7 +1772,7 @@ def verify_equivalence(
             tuple(coverage_solver.eval(value, 1)[0] for value in inputs),
             ("RETURN_DOMAIN_MISMATCH",),
         )
-    total_solver = claripy.Solver()
+    total_solver = new_solver()
     total_solver.add(claripy.And(assumptions, claripy.Not(reference_coverage)))
     if total_solver.satisfiable():
         return VerificationResult(
@@ -1714,7 +1785,7 @@ def verify_equivalence(
             VerificationStatus.UNSUPPORTED,
             reasons=(f"UNSUPPORTED_RETURN_REGISTER:{return_register}",),
         )
-    solver = claripy.Solver()
+    solver = new_solver()
     mismatches: list[claripy.ast.Bool] = []
     uncertain: dict[str, list[claripy.ast.Bool]] = {}
     for lhs in reference.states:
@@ -1781,7 +1852,7 @@ def verify_equivalence(
     # whose contract is unknown leaves the model incomplete, never equivalent.
     unresolved = []
     for kind, values in sorted(uncertain.items()):
-        uncertain_solver = claripy.Solver()
+        uncertain_solver = new_solver()
         uncertain_solver.add(claripy.And(assumptions, _or(values)))
         if uncertain_solver.satisfiable():
             unresolved.append(kind)
@@ -1820,6 +1891,8 @@ DISCOVERY_ROUNDS = 6
 MAXIMUM_DERIVED_POINTERS = 6
 # Pointee extent assumed when the PDB does not type a discovered pointer.
 DEFAULT_POINTEE_SIZE = 64
+# Largest pointee extent that observed accesses may grow an object to.
+MAXIMUM_POINTEE_EXTENT = 1 << 16
 
 
 def verify_under_pdb_aliasing(
@@ -1860,7 +1933,9 @@ def verify_under_pdb_aliasing(
     restarts, up to ``maximum_derived_pointers``. ``pointer_types(type,
     offset)`` returns the PDB (pointee type, pointee size) of a pointer field.
     """
-    from alias_model import AliasCaseLimit, DerivedPointer, iter_alias_scenarios
+    from alias_model import (
+        ALLOCATION_BASE, ALLOCATION_LIMIT, AliasCaseLimit, DerivedPointer, iter_alias_scenarios,
+    )
 
     options = dict(execute_options or {})
     deadline = (
@@ -1910,24 +1985,84 @@ def verify_under_pdb_aliasing(
 
     def pointer_model(scenario):
         values = dict(scenario.pointer_values)
-        sizes = {
-            **{key: size for key, (_, size) in parameter_types.items()},
-            **{item.key: item.pointee_size for item in derived},
-        }
+        canonical = {key: pointer for key, pointer, _, _ in scenario.objects}
         layout = tuple(
-            (key, value, sizes[key]) for key, value in scenario.pointer_values
-            if value and key in sizes
+            (key, pointer, low, high) for key, pointer, low, high in scenario.objects if pointer
         )
-        slots: dict[tuple[int, int], int] = {}
-        returns: dict[tuple[int, str], int] = {}
+        slots: dict[tuple[int, int], object] = {}
+        returns: dict[tuple[int, str], object] = {}
         for item in derived:
             if item.key[0] == "slot":
                 _, root, offset, epoch = item.key
-                base = 0 if root == ("global",) else values.get(root[1], 0)
+                base = 0 if root == ("global",) else canonical.get(root[1], 0)
                 slots[(base + offset, epoch)] = values[item.key]
             else:
                 returns[(item.key[1], item.key[2])] = values[item.key]
-        return {"pointer_slots": slots, "pointer_returns": returns, "pointer_layout": layout}
+        return {
+            "pointer_slots": slots, "pointer_returns": returns, "pointer_layout": layout,
+            "address_map": scenario.address_map, "constraints": scenario.constraints,
+        }
+
+    def grown_extents(scenario, executions) -> dict | str | None:
+        """Extents that cover every access attributed to a fresh object.
+
+        A pointee's modeled extent (the PDB type, or a default for untyped
+        discovered pointers) only bounds the alias cases; code may index past
+        it. Accesses near a canonical object that fall outside its modeled
+        range widen every member of that object (and drop its type, since it
+        is evidently larger than one element). Returns the new extents, an
+        issue string when an access cannot be attributed, or None.
+        """
+        stride = scenario.allocation_stride
+        if not scenario.address_map or not stride:
+            return None
+        arena = (ALLOCATION_BASE, ALLOCATION_LIMIT)
+        centres = [canonical for _, canonical in scenario.address_map]
+        observed: dict[int, list[int]] = {}
+        for execution in executions:
+            for state in execution.states:
+                for kind in ("memory_reads", "memory_writes"):
+                    for address, raw_length in access_log(state, kind):
+                        length = _as_length(raw_length)
+                        if length is None:
+                            continue
+                        if getattr(address, "concrete", False):
+                            low = high = address.concrete_value
+                        else:
+                            try:
+                                low, high = state.solver.min(address), state.solver.max(address)
+                            except Exception:
+                                continue
+                        if high + length <= arena[0] or low >= arena[1]:
+                            continue
+                        centre = next((
+                            item for item in centres
+                            if item - stride // 2 <= low and high + length <= item + stride // 2
+                        ), None)
+                        if centre is None:
+                            return "POINTEE_ACCESS_OUT_OF_RANGE"
+                        bounds = observed.setdefault(centre, [low, high + length])
+                        bounds[0] = min(bounds[0], low)
+                        bounds[1] = max(bounds[1], high + length)
+        changed: dict = {}
+        for centre, (low, high) in observed.items():
+            members = [
+                (key, pointer, member_low, member_high)
+                for key, pointer, member_low, member_high in scenario.objects
+                if centre - stride // 2 <= pointer < centre + stride // 2
+            ]
+            modeled_low = min(pointer + member_low for _, pointer, member_low, _ in members)
+            modeled_high = max(pointer + member_high for _, pointer, _, member_high in members)
+            if modeled_low <= low and high <= modeled_high:
+                continue
+            new_low, new_high = min(low, modeled_low), max(high, modeled_high)
+            for key, pointer, _, _ in members:
+                bias = pointer - new_low
+                size = new_high - new_low
+                if size > MAXIMUM_POINTEE_EXTENT:
+                    return "POINTEE_EXTENT_LIMIT"
+                changed[key] = (size, bias, None)
+        return changed or None
 
     def run(code, calls, base, allocations, homes, arguments, memory, share, model):
         run_options = dict(options)
@@ -1946,13 +2081,21 @@ def verify_under_pdb_aliasing(
             stack_allocations=allocations, entry_homes=homes, **model, **run_options,
         )
 
+    extents: dict = {}
+    # Fresh objects never overlap the stack or either function's code.
+    reserved = (
+        (STACK_LOW, 0x110000),
+        (reference_base, max(len(reference_code), 1)),
+        (candidate_base, max(len(candidate_code), 1)),
+    )
+
     while True:
         known = {item.key for item in derived}
         try:
             scenarios = iter(iter_alias_scenarios(
                 signature, globals=global_objects,
                 maximum_cases=maximum_cases, placements=placements,
-                derived=tuple(derived),
+                derived=tuple(derived), extents=extents, reserved=reserved,
             ))
         except ValueError as error:
             return VerificationResult(
@@ -2022,6 +2165,16 @@ def verify_under_pdb_aliasing(
                 derived.extend(describe(source) for source in discovered)
                 restart = True
                 break
+            growth = grown_extents(scenario, executions)
+            if isinstance(growth, str):
+                return VerificationResult(
+                    VerificationStatus.MODEL_INCOMPLETE,
+                    reasons=(f"ALIAS_SCENARIO:{scenario.name}", growth),
+                )
+            if growth:
+                extents.update(growth)
+                restart = True
+                break
             symbolic_inputs = tuple(
                 value for value in scenario.arguments if value.symbolic
             ) + tuple(value for _, value in scenario.initial_memory)
@@ -2029,6 +2182,7 @@ def verify_under_pdb_aliasing(
                 *executions, symbolic_inputs,
                 observed_memory=observed,
                 return_pointer=signature.return_type.pointer,
+                deadline=deadline,
             )
             if result.status == VerificationStatus.NOT_EQUIVALENT:
                 return VerificationResult(

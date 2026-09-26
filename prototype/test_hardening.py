@@ -75,20 +75,25 @@ class HardeningTests(unittest.TestCase):
             (self.pointer(0x2100), self.pointer(0x2101)),
         )
         cases = alias_scenarios(signature)
-        self.assertEqual(6, len(cases))
-        partitions = {case.pointer_partition for case in cases}
-        self.assertIn((ALLOCATION_BASE, ALLOCATION_BASE), partitions)
-        self.assertIn((0, 0), partitions)
+        # Both null, one null (twice), shared object, distinct objects. Fresh
+        # objects have symbolic bases, so allocation order needs no cases.
+        self.assertEqual(5, len(cases))
+        self.assertTrue(any(
+            case.arguments[0].symbolic and case.arguments[0] is case.arguments[1]
+            for case in cases
+        ))
+        self.assertIn((0, 0), {case.pointer_partition for case in cases})
+        distinct = next(case for case in cases if len(case.address_map) == 2)
+        self.assertTrue(distinct.constraints)
 
     def test_alias_model_includes_pointer_valued_global(self) -> None:
         signature = ABISignature(0x2004, "NearC", self.integer(), ())
         root = PointerGlobal("global_ptr", 0x220000, 4)
         cases = alias_scenarios(signature, pointer_globals=(root,))
         self.assertEqual(2, len(cases))
-        values = {
-            case.initial_memory[-1][1].concrete_value for case in cases
-        }
-        self.assertEqual({0, ALLOCATION_BASE}, values)
+        values = [case.initial_memory[-1][1] for case in cases]
+        self.assertTrue(any(value.concrete and value.concrete_value == 0 for value in values))
+        self.assertTrue(any(value.symbolic for value in values))
 
     def test_pointer_argument_can_alias_pointer_global_pointee(self) -> None:
         signature = ABISignature(
@@ -97,8 +102,8 @@ class HardeningTests(unittest.TestCase):
         root = PointerGlobal("global_ptr", 0x220000, 4)
         cases = alias_scenarios(signature, pointer_globals=(root,))
         self.assertTrue(any(
-            case.arguments[0].concrete_value ==
-            case.initial_memory[-1][1].concrete_value != 0
+            case.arguments[0].symbolic and
+            case.arguments[0] is case.initial_memory[-1][1]
             for case in cases
         ))
 
@@ -818,6 +823,56 @@ class ReviewRegressionTests(unittest.TestCase):
             (x,),
         )
         self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_accesses_beyond_pointee_type_widen_alias_cases(self) -> None:
+        # f(int *p, int *q) { p[1] = 1; *q = 2; return p[1]; }  versus 1.
+        # Only q == p + 1 distinguishes them, beyond sizeof(int).
+        pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)
+        signature = ABISignature(0, "NearC", self.INT, (pointer, pointer))
+        prefix = "8b4c2404 8b542408 c7410401000000 c70202000000"
+        result = verify_under_pdb_aliasing(
+            bytes.fromhex(prefix + "8b4104 c3"),
+            bytes.fromhex(prefix + "b801000000 c3"), signature,
+        )
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_pointer_address_bits_are_symbolic(self) -> None:
+        # return *p + ((uintptr_t)p & 255)  versus  return *p.
+        pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)
+        signature = ABISignature(0, "NearC", self.INT, (pointer,))
+        result = verify_under_pdb_aliasing(
+            bytes.fromhex("8b4c2404 8b01 0fb6c9 01c8 c3"),
+            bytes.fromhex("8b4c2404 8b01 90909090 c3"), signature,
+        )
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_stack_address_published_by_a_wide_store_escapes(self) -> None:
+        # x = 0; MOVQ-copy &x to a global; poke(); return x;  versus 0.
+        target = BASE + 0x200
+        call = CallTarget(target, "?poke@@YAXXZ", 0,
+                          signature=ABISignature(0, "NearC", self.VOID, ()))
+        results = (claripy.BVS("wide_publish_call", 32, explicit_name=True),)
+        head = bytes.fromhex(
+            "83ec08 c7042400000000 8d0424 660f6ec0 660fd60500002000 e8"
+        )
+        call_bytes = rel32(BASE + len(head) - 1, target)
+        reference = head + call_bytes + bytes.fromhex("8b0424 83c408 c3")
+        candidate = head + call_bytes + bytes.fromhex("31c0 90 83c408 c3")
+        result = verify_equivalence(
+            execute(reference, (), (call,), results), execute(candidate, (), (call,), results), (),
+        )
+        self.assertNotEqual(VerificationStatus.EQUIVALENT, result.status)
+
+    def test_verification_respects_the_budget_deadline(self) -> None:
+        import time
+        code = bytes.fromhex("8b442404 c3")
+        value = claripy.BVS("deadline_value", 32, explicit_name=True)
+        result = verify_equivalence(
+            execute(code, (value,)), execute(code, (value,)), (value,),
+            deadline=time.monotonic() - 1,
+        )
+        self.assertEqual(VerificationStatus.INCONCLUSIVE, result.status)
+        self.assertIn("SOLVER_TIMEOUT", result.reasons)
 
     def test_alias_case_limit_is_enforced(self) -> None:
         pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)

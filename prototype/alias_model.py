@@ -10,7 +10,7 @@ symbolic-address heap.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import permutations, product
+from itertools import product
 from typing import Callable, Iterable
 
 import claripy
@@ -54,6 +54,7 @@ class DerivedPointer:
     key: tuple
     pointee_size: int
     pointee_type: int | None = None
+    bias: int = 0
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,12 @@ class AliasScenario:
     pointer_partition: tuple[int | None, ...]
     constraints: tuple[claripy.ast.Bool, ...] = ()
     # Every entity's pointer value, keyed ("param", index) or by derived key.
-    pointer_values: tuple[tuple[tuple, int], ...] = ()
+    pointer_values: tuple[tuple[tuple, object], ...] = ()
+    # Symbolic fresh-object bases and the canonical address storing each.
+    address_map: tuple[tuple[claripy.ast.BV, int], ...] = ()
+    # (entity key, canonical pointer, lowest, highest byte offset) per entity.
+    objects: tuple[tuple[tuple, int, int, int], ...] = ()
+    allocation_stride: int = 0
 
 
 class AliasCaseLimit(ValueError):
@@ -154,7 +160,7 @@ def _group_layouts(members: list[int], entities: list[tuple[int, int | None]],
         if member == host:
             offsets: tuple[int, ...] = (0,)
         else:
-            offsets = _interior_offsets(placements, entities[host], entities[member])
+            offsets = _interior_offsets(placements, entities[host][:2], entities[member][:2])
             typed = placements is not None and placements(
                 entities[host][1], entities[host][0], entities[member][1], entities[member][0],
             ) is not None
@@ -179,40 +185,58 @@ def iter_alias_scenarios(
     maximum_cases: int | None = None,
     placements: Placements | None = None,
     derived: tuple[DerivedPointer, ...] = (),
+    extents: dict[tuple, tuple[int, int, int | None]] | None = None,
+    reserved: tuple[tuple[int, int], ...] = (),
 ) -> Iterable[AliasScenario]:
+    """Enumerate null, alias-partition, placement and global cases.
+
+    A fresh object has a symbolic base address constrained only by what real
+    allocations guarantee: not null, no wrap-around, and no overlap with the
+    other fresh objects, the referenced globals or ``reserved`` ranges. Its
+    bytes are stored at a canonical address (``address_map``), so pointer
+    arithmetic and comparisons stay symbolic while memory stays concrete.
+
+    ``extents`` overrides an entity's (size, bias, type): the pointer
+    addresses ``bias`` bytes into an object of ``size`` bytes.
+    """
     pointer_positions = [index for index, value in enumerate(signature.parameters) if value.pointer]
     for index in pointer_positions:
         if signature.parameters[index].pointee_size is None:
             raise ValueError(
                 f"pointer argument {index} ({signature.parameters[index].name}) has unknown pointee size"
             )
-    entities: list[tuple[int, int | None]] = [
-        (signature.parameters[position].pointee_size or 0,
-         signature.parameters[position].pointee_type)
-        for position in pointer_positions
-    ] + [(item.pointee_size, item.pointee_type) for item in pointer_globals] + [
-        (item.pointee_size, item.pointee_type) for item in derived
-    ]
     keys = (
         *(("param", position) for position in pointer_positions),
         *(("pointer-global", item.address) for item in pointer_globals),
         *(item.key for item in derived),
     )
+    declared = [
+        (signature.parameters[position].pointee_size or 0, 0,
+         signature.parameters[position].pointee_type)
+        for position in pointer_positions
+    ] + [(item.pointee_size, 0, item.pointee_type) for item in pointer_globals] + [
+        (item.pointee_size, item.bias, item.pointee_type) for item in derived
+    ]
+    overrides = extents or {}
+    # (size, type, bias), the order _group_layouts expects.
+    entities: list[tuple[int, int | None, int]] = []
+    for key, (size, bias, type_index) in zip(keys, declared, strict=True):
+        size, bias, type_index = overrides.get(key, (size, bias, type_index))
+        entities.append((max(size, 1), type_index, bias))
     restricted = frozenset(
         ordinal for ordinal, position in enumerate(pointer_positions)
         if signature.parameters[position].restrict
     )
     entity_count = len(entities)
-    # A group with a straddling member spans up to twice the largest pointee.
+    # A group with a straddling member spans up to twice the largest pointee;
+    # each canonical object is centred in a window of twice that, so accesses
+    # just outside an object are attributable to it.
     allocation_stride = max(
         allocation_stride,
-        ((2 * max((size for size, _ in entities), default=1) + 0xFFF) & ~0xFFF),
+        ((4 * max((size for size, _, _ in entities), default=1) + 0xFFF) & ~0xFFF),
     )
-    if allocation_base + entity_count * allocation_stride > ALLOCATION_LIMIT:
+    if allocation_base + (entity_count + 1) * allocation_stride > ALLOCATION_LIMIT:
         raise ValueError("fresh pointer allocations exceed the reserved address range")
-    fresh_addresses = tuple(
-        allocation_base + index * allocation_stride for index in range(entity_count)
-    )
     generated = 0
     null_masks = product((False, True), repeat=entity_count) if include_null else [(False,) * entity_count]
     for null_mask in null_masks:
@@ -229,14 +253,14 @@ def iter_alias_scenarios(
             layouts = [list(_group_layouts(members, entities, placements)) for members in groups]
             for layout in product(*layouts):
                 hosts = [entities[host] for host, _ in layout]
-                # Each group is either a distinct fresh allocation, in every
-                # relative order, or lies inside a referenced global.
+                # Each group is a distinct fresh object or lies inside a
+                # referenced global.
                 global_choices = [
                     tuple(
                         (item.address + offset, item)
                         for item in globals
                         for offset in _interior_offsets(
-                            placements, (item.size, item.type_index), host,
+                            placements, (item.size, item.type_index), host[:2],
                         )
                     )
                     for host in hosts
@@ -245,88 +269,114 @@ def iter_alias_scenarios(
                     if any(mask and not global_choices[group]
                            for group, mask in enumerate(global_mask)):
                         continue
-                    fresh_groups = [group for group in range(group_count) if not global_mask[group]]
-                    for order in permutations(range(len(fresh_groups))):
-                        options: list[tuple] = [()] * group_count
-                        for position, group in enumerate(fresh_groups):
-                            options[group] = ((fresh_addresses[order[position]], None),)
-                        for group in range(group_count):
-                            if global_mask[group]:
-                                options[group] = global_choices[group]
-                        for chosen in product(*options):
-                            scenario = _scenario(
-                                signature, pointer_positions, pointer_globals,
-                                null_mask, partition, layout, hosts, chosen, keys,
-                                entities,
+                    options = [
+                        global_choices[group] if global_mask[group] else ((None, None),)
+                        for group in range(group_count)
+                    ]
+                    for chosen in product(*options):
+                        scenario = _scenario(
+                            signature, pointer_positions, pointer_globals,
+                            null_mask, partition, layout, chosen, keys, entities,
+                            globals, reserved, allocation_base, allocation_stride,
+                        )
+                        if scenario is None:
+                            continue
+                        yield scenario
+                        generated += 1
+                        if maximum_cases is not None and generated >= maximum_cases:
+                            raise AliasCaseLimit(
+                                f"PDB alias model requires more than {maximum_cases} cases"
                             )
-                            if scenario is None:
-                                continue
-                            yield scenario
-                            generated += 1
-                            if maximum_cases is not None and generated >= maximum_cases:
-                                raise AliasCaseLimit(
-                                    f"PDB alias model requires more than {maximum_cases} cases"
-                                )
+
+
+def _disjoint(start, size: int, other_start, other_size: int) -> claripy.ast.Bool:
+    return claripy.Or(
+        claripy.ULE(start + size, other_start),
+        claripy.UGE(start, other_start + other_size),
+    )
 
 
 def _scenario(signature, pointer_positions, pointer_globals, null_mask, partition,
-              layout, hosts, chosen, keys, entities) -> AliasScenario | None:
-    bases = []
-    extents = []
-    for group, (address, owner) in enumerate(chosen):
-        offsets = layout[group][1]
-        low = min(offset for offset in offsets.values())
+              layout, chosen, keys, entities, globals, reserved,
+              allocation_base, allocation_stride) -> AliasScenario | None:
+    pointer_values: list = [claripy.BVV(0, 32)] * len(null_mask)
+    canonical_pointers: list[int] = [0] * len(null_mask)
+    address_map: list[tuple[claripy.ast.BV, int]] = []
+    constraints: list[claripy.ast.Bool] = []
+    fresh: list[tuple[claripy.ast.BV, int]] = []
+    concrete_extents: list[tuple[int, int]] = []
+    objects: list[tuple[tuple, int, int, int]] = []
+    for group, ((_, offsets), (address, owner)) in enumerate(zip(layout, chosen, strict=True)):
+        low = min(offsets.values())
         high = max(offset + entities[member][0] for member, offset in offsets.items())
-        # A fresh group starts at its slot even when a member straddles the
-        # host from below; inside a global, the host keeps its placement.
-        base = address - min(low, 0) if owner is None else address
-        bases.append(base)
-        extents.append((base + low, base + high))
-    # Distinct groups are distinct, non-overlapping objects.
+        if owner is None:
+            slot = len(fresh)
+            canonical = allocation_base + slot * allocation_stride + allocation_stride // 2
+            base = claripy.BVS(f"alias_base_{slot}", 32, explicit_name=True)
+            extent = high - low
+            constraints.extend((
+                claripy.UGE(base, 0x10000),
+                claripy.ULE(base, 0xFFFFFFFF - extent),
+                *(_disjoint(base, extent, other, other_extent) for other, other_extent in fresh),
+                *(_disjoint(base, extent, claripy.BVV(item.address, 32), item.size)
+                  for item in globals),
+                *(_disjoint(base, extent, claripy.BVV(start, 32), size) for start, size in reserved),
+            ))
+            fresh.append((base, extent))
+            address_map.append((base, canonical))
+            for member, offset in offsets.items():
+                start = offset - low
+                bias = entities[member][2]
+                pointer_values[member] = base + (start + bias)
+                canonical_pointers[member] = canonical + start + bias
+        else:
+            concrete_extents.append((address + low, address + high))
+            for member, offset in offsets.items():
+                bias = entities[member][2]
+                pointer_values[member] = claripy.BVV(address + offset + bias, 32)
+                canonical_pointers[member] = address + offset + bias
+        for member in offsets:
+            size, _, bias = entities[member]
+            objects.append((keys[member], canonical_pointers[member], -bias, size - bias))
+    # Distinct groups placed in globals are distinct, non-overlapping objects.
     if any(left[0] < right[1] and right[0] < left[1]
-           for index, left in enumerate(extents) for right in extents[index + 1:]):
+           for index, left in enumerate(concrete_extents)
+           for right in concrete_extents[index + 1:]):
         return None
-    pointer_values: list[int] = [0] * len(null_mask)
-    for group, (_, offsets) in enumerate(layout):
-        for member, offset in offsets.items():
-            pointer_values[member] = bases[group] + offset
     arguments: list[claripy.ast.BV] = []
     for index, parameter in enumerate(signature.parameters):
         if parameter.pointer:
-            arguments.append(claripy.BVV(pointer_values[pointer_positions.index(index)], 32))
+            arguments.append(pointer_values[pointer_positions.index(index)])
         else:
             arguments.append(claripy.BVS(
                 f"abi_arg_{index}", parameter.size * 8, explicit_name=True,
             ))
-    # Pointee contents are modeled lazily by address like any other memory,
-    # so pointers stored inside them can themselves be followed.
-    memory: list[tuple[int, claripy.ast.BV]] = []
-    for ordinal, pointer_global in enumerate(pointer_globals, start=len(pointer_positions)):
-        memory.append((pointer_global.address, claripy.BVV(pointer_values[ordinal], 32)))
+    memory: list[tuple[int, claripy.ast.BV]] = [
+        (pointer_global.address, pointer_values[ordinal])
+        for ordinal, pointer_global in enumerate(pointer_globals, start=len(pointer_positions))
+    ]
     description = "null=" + "".join("1" if item else "0" for item in null_mask)
     description += ";partition=" + ",".join(map(str, partition))
     interior = [
-        f"{member}+{offset}" for _, offsets in layout
+        f"{member}{offset:+d}" for _, offsets in layout
         for member, offset in sorted(offsets.items()) if offset
     ]
     if interior:
         description += ";interior=" + ",".join(interior)
-    description += ";bases=" + ",".join(f"{base:x}" for base in bases)
     selected_globals = [
         f"{item.logical_id}+{address - item.address}"
         for address, item in chosen if item is not None
     ]
     if selected_globals:
         description += ";globals=" + ",".join(selected_globals)
-    if pointer_globals:
-        description += ";pointer-globals=" + ",".join(
-            f"{item.logical_id}:{pointer_values[index]}"
-            for index, item in enumerate(pointer_globals, start=len(pointer_positions))
-        )
     return AliasScenario(
         description, tuple(arguments), tuple(memory),
-        tuple(pointer_values[:len(pointer_positions)]),
+        tuple(canonical_pointers[:len(pointer_positions)]),
+        tuple(constraints),
         pointer_values=tuple(zip(keys, pointer_values, strict=True)),
+        address_map=tuple(address_map),
+        objects=tuple(objects),
+        allocation_stride=allocation_stride,
     )
 
 

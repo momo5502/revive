@@ -88,10 +88,14 @@ Then classify it:
   --build C:\path\to\reconstruction\build `
   --pdb C:\path\to\reference.pdb `
   --exe C:\path\to\reference.exe `
-  --jobs 4
+  --jobs 12
 ```
 
-The default execution timeout is 300 seconds per side, per alias scenario.
+Each function has a total budget of 60 seconds (`--function-timeout`),
+covering extraction and every alias case; a worker is killed 30 seconds after
+that (`--worker-timeout`). All logical CPUs are used by default (`--jobs`),
+and a worker above `--memory-limit` (8 GiB) is killed. Exhausting a limit is
+`INCONCLUSIVE`. `--order random --seed N` samples reproducibly.
 Each function runs in a disposable child process so a native Z3 failure is
 recorded as `SOLVER_CRASH` without killing the campaign. Results are written
 atomically to `campaign/results.tsv`; generated campaign data is intentionally
