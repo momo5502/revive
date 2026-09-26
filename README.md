@@ -35,7 +35,8 @@ and stack balance are not independently observable.
 
 ## Setup
 
-Revive runs natively on Windows. Python 3.12 was used during development.
+Revive runs natively on Windows. Python 3.12 was used during development; the
+pinned packages also work on Python 3.14.
 
 ```powershell
 py -3 -m venv .venv

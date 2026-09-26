@@ -18,7 +18,10 @@ import sys
 
 import capstone
 
-from pdb_frontend import ABISignature, ABIType, extract_function_metadata
+from pdb_frontend import (
+    ABISignature, ABIType, extract_function_metadata, normalized_path,
+    recorded_parameter_homes, type_database,
+)
 
 
 class RelocationResolutionError(RuntimeError):
@@ -31,6 +34,7 @@ class MemoryObjectContract:
     address: int
     size: int
     content: bytes | None = None
+    type_index: int | None = None  # target PDB type, when one names the object
 
 
 @dataclass(frozen=True)
@@ -41,8 +45,9 @@ class PointerGlobalContract:
 
 
 TLS_ARRAY_POINTER = 0x2C
-TLS_ARRAY_BASE = 0x21000000
-TLS_BLOCK_BASE = 0x22000000
+# Outside the synthetic constant range (_synthetic_rva) and alias allocations.
+TLS_ARRAY_BASE = 0x30000000
+TLS_BLOCK_BASE = 0x31000000
 
 
 def _word_type(name: str = "unsigned int", *, pointer: bool = False) -> ABIType:
@@ -83,36 +88,54 @@ def _runtime_call_target(address: int, symbol: str):
     )
 
 
+C_STDCALL_SYMBOL = re.compile(r"^_[A-Za-z_$][\w$]*@(\d+)$")
+C_CDECL_SYMBOL = re.compile(r"^_[A-Za-z_$][\w$]*$")
+
+
 def _untyped_call_target(address: int, symbol: str,
                          callsites: list[tuple[int, int | None]]):
-    """Derive a conservative word ABI when no procedure record exists."""
+    """Derive a word ABI for a PDB-absent callee only when it is certain.
+
+    C decoration fixes stdcall stack size. An undecorated C symbol is cdecl,
+    whose argument count is known only when every call site pops it. Other
+    identities (C++ mangling, fastcall, unnamed addresses) are rejected
+    rather than guessed, because a wrong ABI silently drops arguments.
+    """
     from angr_equiv import CallTarget
 
     if symbol == "__CIsqrt":
         signature = ABISignature(
             0, "NearC", ABIType(0, "double", 8, "double"), (),
         )
+        # Consumes ST0 and returns the root in ST0.
         return CallTarget(
             address, symbol, 0, argument_registers=("x87_st0",),
-            return_register="x87_st0", signature=signature,
+            return_register="x87_st0", signature=signature, x87_pops=1,
         )
     if symbol == "__ftol2_sse":
         signature = ABISignature(
             0, "NearC", ABIType(0, "__int64", 8, "integer"), (),
         )
+        # Converts and pops ST0, like FISTP, returning EDX:EAX.
         return CallTarget(
             address, symbol, 0, argument_registers=("x87_st0",),
-            return_register="edx_eax", signature=signature,
+            return_register="edx_eax", signature=signature, x87_pops=1,
         )
 
-    decorated = re.search(r"@(\d+)$", symbol)
-    cleaned = [count for _, count in callsites if count is not None]
-    count = int(decorated.group(1)) // 4 if decorated else max(cleaned, default=0)
-    convention = (
-        "NearFast" if symbol.startswith("@") else
-        "NearStdCall" if decorated and symbol.startswith("_") else
-        "NearC"
-    )
+    stdcall = C_STDCALL_SYMBOL.match(symbol)
+    if stdcall:
+        convention, count = "NearStdCall", int(stdcall.group(1)) // 4
+    elif C_CDECL_SYMBOL.match(symbol):
+        counts = {count for _, count in callsites}
+        if not callsites or None in counts or len(counts) != 1:
+            return CallTarget(address, symbol, 0, frontend_issues=(
+                f"UNSUPPORTED_CALL_ABI:{symbol}:cdecl argument count is not fixed by every call site",
+            ))
+        convention, count = "NearC", counts.pop()
+    else:
+        return CallTarget(address, symbol, 0, frontend_issues=(
+            f"UNSUPPORTED_CALL_ABI:{symbol}:no PDB procedure type",
+        ))
     parameters = tuple(_word_type() for _ in range(count))
     signature = ABISignature(0, convention, _word_type(), parameters)
     return CallTarget(address, symbol, count, signature=signature)
@@ -149,7 +172,7 @@ def pdb_call_target(
 
     runtime = _runtime_call_target(address, decorated_symbol)
     if runtime is not None:
-        return runtime
+        return runtime, None
 
     matcher = pair["matcher"]
     try:
@@ -164,7 +187,7 @@ def pdb_call_target(
             return CallTarget(
                 address, decorated_symbol, 0,
                 frontend_issues=(f"UNSUPPORTED_CALL_IDENTITY:{decorated_symbol}",),
-            )
+            ), None
         record = matches[0]
     record = _procedure_metadata_record(pair["inventory"], record)
     relocation_symbols: tuple[str, ...] = ()
@@ -188,13 +211,78 @@ def pdb_call_target(
         "x87_st0" if signature and signature.return_type.kind in ("float", "double")
         else "eax"
     )
-    return CallTarget(
+    contract = CallTarget(
         address, decorated_symbol,
         len(signature.parameters) if signature else 0,
         fresh_result=fresh_result, havoc_memory=havoc_memory,
         return_register=return_register, signature=signature,
         frontend_issues=metadata.issues,
     )
+    return contract, record
+
+
+def _candidate_signature(pair: dict, candidate_record: dict, signature: ABISignature):
+    """The candidate PDB's own view of a procedure's parameters.
+
+    Parameter records carry candidate-PDB type indices, so entry homes must
+    be recovered against the candidate's signature. It has to agree with the
+    target's parameter layout; otherwise the ABIs differ outright.
+    """
+    metadata = extract_function_metadata(
+        pair["matcher"], pair["tool"], candidate_pdb_path(pair["build"]), candidate_record,
+    )
+    candidate = metadata.signature
+    if candidate is None:
+        return None, metadata.issues or ("UNSUPPORTED_PDB_ABI:candidate signature",)
+    shape = lambda value: tuple((item.size, item.kind) for item in value.parameters)
+    if (shape(candidate) != shape(signature) or
+            candidate.return_type.size != signature.return_type.size or
+            candidate.calling_convention != signature.calling_convention):
+        return None, (f"CANDIDATE_SIGNATURE_MISMATCH:{candidate.calling_convention}:"
+                      f"{[item.name for item in candidate.parameters]}",)
+    return candidate, ()
+
+
+def entry_homes(pair: dict, reference_record: dict, signature: ABISignature,
+                reference_prologue: bool, candidate_record: dict | None,
+                candidate_prologue: bool):
+    """Per-side entry homes: (reference, candidate, issues)."""
+    matcher, tool = pair["matcher"], pair["tool"]
+    reference_homes, issues = recorded_parameter_homes(
+        matcher, tool, pair["pdb"], reference_record, signature, reference_prologue,
+    )
+    if candidate_record is None:
+        # Custom conventions exist only for procedures the candidate PDB
+        # describes; an absent body is reached through its declaration.
+        return reference_homes, None, issues
+    candidate_signature, candidate_issues = _candidate_signature(pair, candidate_record, signature)
+    if candidate_signature is None:
+        return reference_homes, None, (*issues, *candidate_issues)
+    candidate_homes, candidate_issues = recorded_parameter_homes(
+        matcher, tool, candidate_pdb_path(pair["build"]), candidate_record,
+        candidate_signature, candidate_prologue,
+    )
+    return reference_homes, candidate_homes, (*issues, *candidate_issues)
+
+
+def _candidate_record_for(pair: dict, target_record: dict, symbol: str) -> dict | None:
+    candidate_pdb = candidate_pdb_path(pair["build"])
+    if not candidate_pdb.is_file():
+        return None
+    matcher = pair["matcher"]
+    index = _candidate_procedure_index(pair)
+    publics = index["by_public"].get(symbol, ())
+    if publics:
+        return publics[0] if len(publics) == 1 else None
+    try:
+        wanted = normalized_path(matcher.candidate_path(pair["build"], target_record))
+    except Exception:
+        return None
+    matches = [
+        item for item in index["by_object"].get(wanted, ())
+        if item.get("name") == target_record.get("name")
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _direct_calls(code: bytes, base: int) -> list[tuple[int, int, int | None]]:
@@ -221,9 +309,12 @@ def _direct_calls(code: bytes, base: int) -> list[tuple[int, int, int | None]]:
 
 
 def external_call_contracts(pair: dict):
-    """Build PDB-typed summaries for every direct call leaving the function."""
+    """PDB-typed summaries for every direct call leaving the function.
+
+    Returns (reference contracts, candidate contracts): each side calls a
+    TU-local callee through that side's own compiler-chosen entry homes.
+    """
     base = pair["address"]
-    end = base + max(len(pair["reference"]), len(pair["candidate"]))
     reference_calls = _direct_calls(pair["reference"], base)
     candidate_calls = _direct_calls(pair["candidate"], base)
 
@@ -251,12 +342,17 @@ def external_call_contracts(pair: dict):
         procedures_by_target.setdefault(target, []).append(name)
 
     calls_by_target: dict[int, list[tuple[int, int | None]]] = {}
-    for callsite, target, count in (*reference_calls, *candidate_calls):
-        if base <= target < end:
-            continue
-        calls_by_target.setdefault(target, []).append((callsite, count))
+    # A call is internal only when it lands inside the calling side's own
+    # bytes; the candidate may be longer than the reference and reach the
+    # reference's next function.
+    for code, calls in ((pair["reference"], reference_calls),
+                        (pair["candidate"], candidate_calls)):
+        for callsite, target, count in calls:
+            if base <= target < base + len(code):
+                continue
+            calls_by_target.setdefault(target, []).append((callsite, count))
 
-    contracts = []
+    reference_contracts, candidate_contracts = [], []
     for target, callsites in sorted(calls_by_target.items()):
         symbol = symbol_by_target.get(target)
         if symbol is None:
@@ -267,9 +363,11 @@ def external_call_contracts(pair: dict):
             if not names:
                 names = sorted(set(procedures_by_target.get(target, ())))
             symbol = names[0] if names else f"address@{target:08x}"
-        contract = pdb_call_target(pair, target, symbol)
+        contract, record = pdb_call_target(pair, target, symbol)
         if contract.frontend_issues:
-            contract = _untyped_call_target(target, symbol, callsites)
+            fallback = _untyped_call_target(target, symbol, callsites)
+            if not fallback.frontend_issues:
+                contract, record = fallback, None
         if contract.signature and contract.signature.variadic:
             fixed = len(contract.signature.parameters)
             counts = tuple(
@@ -281,8 +379,36 @@ def external_call_contracts(pair: dict):
                 argument_count=max((count for _, count in counts), default=fixed),
                 callsite_argument_counts=counts,
             )
-        contracts.append(contract)
-    return tuple(contracts)
+        reference_contract = candidate_contract = contract
+        if record is not None and contract.signature and not contract.frontend_issues:
+            try:
+                prologue = pair["pe"].read(target - pair["pe"].image_base, 3) == FRAME_PROLOGUE
+            except Exception:
+                prologue = False
+            reference_homes, candidate_homes, issues = entry_homes(
+                pair, record, contract.signature, prologue,
+                _candidate_record_for(pair, record, symbol),
+                # The candidate callee body is not extracted; VC8 frames
+                # recorded with a frame pointer begin with the standard
+                # prologue.
+                True,
+            )
+            # A callee whose candidate declaration differs cannot be modeled
+            # consistently on both sides.
+            issues = tuple(
+                f"UNMODELED_CALLEE_{issue}" if issue.startswith("CANDIDATE_SIGNATURE_MISMATCH")
+                else issue
+                for issue in issues
+            )
+            reference_contract = replace(
+                contract, entry_homes=reference_homes, frontend_issues=issues,
+            )
+            candidate_contract = replace(
+                contract, entry_homes=candidate_homes, frontend_issues=issues,
+            )
+        reference_contracts.append(reference_contract)
+        candidate_contracts.append(candidate_contract)
+    return tuple(reference_contracts), tuple(candidate_contracts)
 
 
 def global_object_contracts(pair: dict) -> tuple[MemoryObjectContract, ...]:
@@ -412,8 +538,12 @@ def global_object_contracts(pair: dict) -> tuple[MemoryObjectContract, ...]:
                 selected[(rva, len(content))] = (
                     f"target_literal@{rva:x}", content,
                 )
+    owner_types = _target_owner_types(pair)
     contracts = [
-        MemoryObjectContract(name, pair["pe"].image_base + rva, size, content)
+        MemoryObjectContract(
+            name, pair["pe"].image_base + rva, size, content,
+            owner_types.get((rva, size)) if content is None else None,
+        )
         for (rva, size), (name, content) in sorted(selected.items())
     ]
     tls_relocations = [
@@ -458,6 +588,224 @@ def global_object_contracts(pair: dict) -> tuple[MemoryObjectContract, ...]:
             ))
     unique = {(item.address, item.size): item for item in contracts}
     return tuple(unique[key] for key in sorted(unique))
+
+
+def _target_type_db(pair: dict):
+    return type_database(pair["matcher"], pair["tool"], pair["pdb"])
+
+
+def _target_owner_types(pair: dict) -> dict[tuple[int, int], int]:
+    """Map each typed target global's (rva, size) to its unique PDB type."""
+    matcher, pe = pair["matcher"], pair["pe"]
+    db = _target_type_db(pair)
+    types: dict[tuple[int, int], set[int]] = {}
+    records = list(pair["inventory"].get("data_symbols", ()))
+    for values in matcher.load_globals(pair["build"], pair["pdb"], pair["tool"], False).values():
+        records.extend(values)
+    for record in records:
+        type_index = record.get("type")
+        try:
+            rva = pe.rva(record["section"], record["offset"])
+        except Exception:
+            continue
+        size = matcher.type_size(db, type_index)
+        if size:
+            types.setdefault((rva, size), set()).add(type_index)
+    return {key: next(iter(values)) for key, values in types.items() if len(values) == 1}
+
+
+SIMPLE_CHARACTER_TYPES = {0x10, 0x20, 0x68, 0x69, 0x70}
+
+
+def type_placements(pair: dict):
+    """PDB layout-directed interior placements for the alias model.
+
+    An object of the inner type may lie at every offset where the outer
+    type's layout (members, base classes, array elements, recursively)
+    contains a compatible type. Character and void pointees may address any
+    byte. Unknown types return None so the alias model considers every
+    aligned offset.
+    """
+    matcher = pair["matcher"]
+    db = _target_type_db(pair)
+    memo: dict[int, dict[tuple, frozenset[int]]] = {}
+
+    def canonical(index):
+        index = matcher.strip_qualifiers(db, index)
+        return matcher.resolve_forward_ref(db, index) if index is not None and index >= 0x1000 else index
+
+    def shape(index) -> tuple | None:
+        """A compatibility key: MSVC does not use type-based alias analysis,
+        so same-sized scalars of one class, and all pointers, are compatible."""
+        index = canonical(index)
+        if index is None:
+            return None
+        if index < 0x1000:
+            if matcher.simple_pointer_base(index) is not None:
+                return ("pointer",)
+            size = matcher.type_size(db, index)
+            real = (index & 0xFF) in (0x40, 0x41, 0x42)
+            return ("real" if real else "integer", size)
+        record = db.get(index) or {}
+        kind = record.get("Kind")
+        if kind == "LF_POINTER":
+            return ("pointer",)
+        if kind == "LF_ENUM":
+            return shape(record["Enum"].get("UnderlyingType"))
+        return ("record", index)
+
+    def contained(index) -> dict[tuple, frozenset[int]]:
+        """Offsets of every type shape occurring inside ``index``."""
+        index = canonical(index)
+        if index in memo:
+            return memo[index]
+        memo[index] = {}
+        result: dict[tuple, set[int]] = {}
+        own = shape(index)
+        if own is not None:
+            result.setdefault(own, set()).add(0)
+        record = db.get(index) if index is not None and index >= 0x1000 else None
+        kind = (record or {}).get("Kind")
+        children: list[tuple[int, int | None]] = []
+        if kind == "LF_ARRAY":
+            element = record["Array"].get("ElementType")
+            element_size = matcher.type_size(db, element)
+            total = matcher.type_size(db, index)
+            if element_size and total:
+                children.extend((offset, element) for offset in range(0, total, element_size))
+        elif kind in matcher.CLASS_LIKE_KINDS or kind == "LF_UNION":
+            body = record["Union" if kind == "LF_UNION" else "Class"]
+            for _, offset, member in matcher.members_of(db, body.get("FieldList")) or ():
+                children.append((offset, member))
+        nested_cache: dict[int | None, dict[tuple, frozenset[int]]] = {}
+        for offset, child in children:
+            if child not in nested_cache:
+                nested_cache[child] = contained(child)
+            for key, offsets in nested_cache[child].items():
+                result.setdefault(key, set()).update(offset + item for item in offsets)
+        memo[index] = {key: frozenset(values) for key, values in result.items()}
+        return memo[index]
+
+    def placements(outer_type, outer_size, inner_type, inner_size):
+        if outer_type is None or inner_type is None:
+            return None
+        inner = canonical(inner_type)
+        if inner is not None and inner < 0x1000 and (
+                (inner & 0xFF) in SIMPLE_CHARACTER_TYPES or (inner & 0xFF) == 0x03):
+            return tuple(range(0, max(outer_size - inner_size + 1, 0)))
+        key = shape(inner)
+        if key is None:
+            return None
+        return tuple(sorted(contained(outer_type).get(key, ())))
+
+    return placements
+
+
+_CANDIDATE_INDEXES: dict[str, dict] = {}
+
+
+def _candidate_procedure_index(pair: dict) -> dict:
+    """Candidate PDB procedures grouped by object and public symbol, built
+    once per process (path normalization per record was the dominant cost)."""
+    candidate_pdb = candidate_pdb_path(pair["build"])
+    key = normalized_path(candidate_pdb)
+    if key not in _CANDIDATE_INDEXES:
+        inventory = pair["matcher"].load_inventory(
+            pair["build"], candidate_pdb, pair["tool"], False,
+        )
+        by_object: dict[str, list[dict]] = {}
+        by_public: dict[str, list[dict]] = {}
+        for item in inventory.get("procedures", ()):
+            by_object.setdefault(normalized_path(item.get("object") or ""), []).append(item)
+            for symbol in item.get("public_symbols") or ():
+                by_public.setdefault(symbol, []).append(item)
+        _CANDIDATE_INDEXES[key] = {
+            "inventory": inventory, "by_object": by_object, "by_public": by_public,
+        }
+    return _CANDIDATE_INDEXES[key]
+
+
+def candidate_pdb_path(build: Path) -> Path:
+    return build / "src" / "win32" / "iw4_multiplayer.pdb"
+
+
+def candidate_procedure_record(pair: dict) -> dict | None:
+    """The candidate PDB procedure record for the extracted candidate body."""
+    candidate_pdb = candidate_pdb_path(pair["build"])
+    if not candidate_pdb.is_file():
+        return None
+    matches = list(
+        _candidate_procedure_index(pair)["by_object"].get(normalized_path(pair["object"]), ())
+    )
+    symbol = pair["record"].get("candidate_symbol")
+    if symbol:
+        matches = [item for item in matches if symbol in (item.get("public_symbols") or ())]
+    else:
+        matches = [
+            item for item in matches
+            if item.get("name") == pair["record"].get("name") and
+            item.get("size") == len(pair["candidate"])
+        ]
+    return matches[0] if len(matches) == 1 else None
+
+
+# push ebp; mov ebp, esp: EBP is the entry ESP minus the saved EBP slot.
+FRAME_PROLOGUE = b"\x55\x8b\xec"
+
+
+def stack_allocation_contracts(pair: dict):
+    """Logical stack objects shared by both frames, from both PDBs.
+
+    A local is modeled only when both procedures are EBP-framed, both PDB
+    records are fully understood, and it has one unique, non-overlapping
+    home of the same size on each side. Other escaping stack storage keeps
+    the conservative extent model.
+    """
+    from angr_equiv import LogicalAllocation, STACK_BASE
+    from pdb_frontend import frame_layout
+
+    candidate_record = candidate_procedure_record(pair)
+    if candidate_record is None:
+        return (), ()
+    matcher, tool = pair["matcher"], pair["tool"]
+    layouts = (
+        frame_layout(matcher, tool, pair["pdb"],
+                     _procedure_metadata_record(pair["inventory"], pair["record"])),
+        frame_layout(matcher, tool, candidate_pdb_path(pair["build"]), candidate_record),
+    )
+    codes = (pair["reference"], pair["candidate"])
+    if any(not layout.complete or not code.startswith(FRAME_PROLOGUE)
+           for layout, code in zip(layouts, codes, strict=True)):
+        return (), ()
+    frame_base = STACK_BASE - 4
+    sides: list[dict[str, tuple[int, int]]] = []
+    for layout in layouts:
+        names = [item.name for item in layout.locals]
+        sides.append({
+            f"local:{item.name}": (frame_base + item.frame_offset, item.size)
+            for item in layout.locals
+            # Parameters (positive offsets) may be homed per a custom
+            # register convention; only frame locals are correlated here.
+            if item.frame_offset < 0 and names.count(item.name) == 1
+        })
+    common = [
+        key for key in sides[0]
+        if key in sides[1] and sides[0][key][1] == sides[1][key][1]
+    ]
+
+    def overlapping(side: dict[str, tuple[int, int]], key: str) -> bool:
+        start, size = side[key]
+        return any(
+            other != key and start < side[other][0] + side[other][1] and
+            side[other][0] < start + size
+            for other in side
+        )
+
+    kept = [key for key in common if not any(overlapping(side, key) for side in sides)]
+    return tuple(
+        tuple(LogicalAllocation(key, side[key][0], side[key][1]) for key in sorted(kept))
+        for side in sides
+    )
 
 
 def pointer_global_contracts(pair: dict) -> tuple[PointerGlobalContract, ...]:
@@ -615,16 +963,38 @@ def _relocated_pointer_table_bytes(matcher, pe, coff: dict,
     return bytes(result)
 
 
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_SCN_MEM_WRITE = 0x80000000
+
+
+def _section_characteristics(pe) -> list[int]:
+    headers = pe.optional_header + pe.optional_size
+    return [
+        struct.unpack_from("<I", pe.data, headers + number * 40 + 36)[0]
+        for number in range(len(pe.sections))
+    ]
+
+
 def _find_content_rva(pe, content: bytes) -> int | None:
+    """Locate an immutable constant by content in read-only image data.
+
+    Code and writable data are excluded: equal bytes there are not the same
+    constant. A NUL-terminated string must start at a string boundary, not
+    at the tail of a longer string.
+    """
+    string = content.endswith(b"\0") and b"\0" not in content[:-1]
     matches: list[int] = []
-    for section in pe.sections:
+    for section, characteristics in zip(pe.sections, _section_characteristics(pe), strict=True):
+        if characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE):
+            continue
         raw = pe.data[section.raw_offset:section.raw_offset + section.raw_size]
         start = 0
         while True:
             offset = raw.find(content, start)
             if offset < 0:
                 break
-            matches.append(section.virtual_address + offset)
+            if not string or offset == 0 or raw[offset - 1] == 0:
+                matches.append(section.virtual_address + offset)
             start = offset + 1
     return min(matches) if matches else None
 
@@ -822,6 +1192,7 @@ def _target_symbol_rva(
     coff: dict, relocation: dict, public_by_name: dict[str, int],
     target_data_rvas: dict[str, int], target_function_rvas: dict[str, int],
     reference: bytes, target_data_owners: tuple[dict, ...],
+    provenance: dict | None = None,
 ) -> int:
     symbol = relocation.get("target")
     if not symbol:
@@ -904,6 +1275,11 @@ def _target_symbol_rva(
         ):
             addend = struct.unpack_from("<i", coff["bytes"], relocation["offset"])[0]
             candidates.add(effective_rva - addend)
+            # The identity is borrowed from the reference being compared, so
+            # a wrong candidate reference cannot be detected. Callers must
+            # not report equivalence that rests on it.
+            if provenance is not None:
+                provenance["rule"] = "reference_address_hint"
 
     target_record = relocation.get("target_record")
     if (matcher.JUMP_TABLE_LABEL_RE.match(symbol) and target_record and
@@ -966,6 +1342,7 @@ def relocate_candidate(
         kind = relocation["type"]
         if offset + 4 > len(candidate):
             raise RelocationResolutionError(f"relocation +0x{offset:x} lies outside function")
+        provenance: dict = {}
         if kind == matcher.DIR32 and relocation.get("target") == "__tls_array":
             encoded = 0x2C
             target_rva = None
@@ -973,7 +1350,7 @@ def relocate_candidate(
             target_rva = _target_symbol_rva(
                 matcher, repository, inventory, pe, owner, coff, relocation,
                 public_by_name, target_data_rvas, target_function_rvas,
-                reference, target_data_owners,
+                reference, target_data_owners, provenance,
             )
             addend = struct.unpack_from("<i", coff["bytes"], offset)[0]
             if kind == matcher.REL32:
@@ -989,7 +1366,10 @@ def relocate_candidate(
                     f"{relocation.get('target')}: unsupported relocation type 0x{kind:x}"
                 )
         struct.pack_into("<I", candidate, offset, encoded & 0xFFFFFFFF)
-        resolutions.append({**relocation, "target_rva": target_rva})
+        resolutions.append({
+            **relocation, "target_rva": target_rva,
+            **({"identity_rule": provenance["rule"]} if "rule" in provenance else {}),
+        })
     return bytes(candidate), tuple(resolutions)
 
 
@@ -1030,8 +1410,8 @@ def _annotate_candidate_data(
         return resolutions
     inventory = matcher.load_inventory(build, candidate_pdb, tool, False)
     globals_by_name = matcher.load_globals(build, candidate_pdb, tool, False)
-    db = matcher.TypeDB(matcher.dump_tpi(tool, candidate_pdb))
-    wanted_object = str(object_path.resolve()).lower()
+    db = type_database(matcher, tool, candidate_pdb)
+    wanted_object = normalized_path(object_path)
     annotated = []
     for relocation in resolutions:
         symbol = relocation.get("target") or ""
@@ -1044,7 +1424,7 @@ def _annotate_candidate_data(
                 matches.extend({"name": name, **item} for item in records)
         owned = [
             item for item in matches
-            if str(Path(item.get("object") or "").resolve()).lower() == wanted_object
+            if normalized_path(item.get("object") or "") == wanted_object
         ]
         if len(owned) == 1:
             matches = owned
@@ -1122,7 +1502,7 @@ def extract(repository: Path, build: Path, pdb: Path, exe: Path, symbol: str):
         build=build, inventory=inventory,
     )
 
-    return {
+    pair = {
         "matcher": matcher,
         "inventory": inventory,
         "tool": tool,
@@ -1140,7 +1520,19 @@ def extract(repository: Path, build: Path, pdb: Path, exe: Path, symbol: str):
         "signature": metadata.signature,
         "frontend_issues": metadata.issues,
         "typed_symbol_indices": metadata.typed_symbol_indices,
+        "reference_homes": None,
+        "candidate_homes": None,
     }
+    if metadata.signature is not None:
+        reference_homes, candidate_homes, issues = entry_homes(
+            pair, metadata_record, metadata.signature,
+            reference.startswith(FRAME_PROLOGUE), candidate_procedure_record(pair),
+            candidate.startswith(FRAME_PROLOGUE),
+        )
+        pair["reference_homes"] = reference_homes
+        pair["candidate_homes"] = candidate_homes
+        pair["frontend_issues"] = (*pair["frontend_issues"], *issues)
+    return pair
 
 
 def main() -> int:

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import os
 from pathlib import Path
+import pickle
 import re
 import subprocess
 from typing import Any
@@ -38,6 +40,7 @@ class ABIType:
     volatile: bool = False
     restrict: bool = False
     pointee_size: int | None = None
+    pointee_type: int | None = None
 
     @property
     def pointer(self) -> bool:
@@ -61,12 +64,50 @@ class FunctionMetadata:
     typed_symbol_indices: tuple[int, ...] = ()
 
 
+CACHE_DIRECTORY = Path(
+    os.environ.get("REVIVE_CACHE") or Path(__file__).resolve().parent.parent / ".cache"
+)
+
+
 @lru_cache(maxsize=8)
-def _type_records(tool: str, pdb: str) -> tuple[dict, ...]:
+def _type_database(tool: str, pdb: str):
+    """The matcher's TypeDB for a PDB, parsed once and cached on disk.
+
+    Parsing a PDB's type stream from llvm-pdbutil output takes 10-20 s and
+    every worker needs both PDBs. The pickle is keyed by the PDB's path, size
+    and modification time, so a rebuilt candidate PDB is parsed again.
+    """
     # Imported lazily so this module remains usable with any matcher exposing
     # the same TypeDB/dump_tpi API.
     import artifact_matcher as matcher
-    return tuple(matcher.dump_tpi(Path(tool), Path(pdb)))
+
+    status = os.stat(pdb)
+    key = f"{Path(pdb).stem}-{status.st_size:x}-{status.st_mtime_ns:x}"
+    cache = CACHE_DIRECTORY / f"types-{key}.pickle"
+    try:
+        with cache.open("rb") as stream:
+            return pickle.load(stream)
+    except (OSError, pickle.PickleError, EOFError, AttributeError, ImportError):
+        pass
+    database = matcher.TypeDB(list(matcher.dump_tpi(Path(tool), Path(pdb))))
+    try:
+        CACHE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
+        with temporary.open("wb") as stream:
+            pickle.dump(database, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(cache)
+    except OSError:
+        pass
+    return database
+
+
+def type_database(matcher: Any, tool: Path, pdb: Path):
+    return _type_database(str(tool), str(pdb))
+
+
+def normalized_path(value: str | Path) -> str:
+    """Comparable path spelling without touching the filesystem."""
+    return os.path.normcase(os.path.abspath(str(value)))
 
 
 @lru_cache(maxsize=128)
@@ -136,9 +177,11 @@ def _abi_type(matcher: Any, db: Any, index: int) -> ABIType:
         raise ValueError(f"PDB type 0x{index:x} has no ABI size")
     if pointer:
         kind = "pointer"
-    elif (unqualified & 0xFF) == 0x40:
+    # Simple (non-record) CodeView types only: T_REAL32 and T_REAL64. A
+    # complex type index can share the low byte.
+    elif unqualified == 0x40:
         kind = "float"
-    elif (unqualified & 0xFF) == 0x41:
+    elif unqualified == 0x41:
         kind = "double"
     elif size == 0:
         kind = "void"
@@ -149,6 +192,7 @@ def _abi_type(matcher: Any, db: Any, index: int) -> ABIType:
     return ABIType(
         index, matcher.describe_type(db, index), size, kind, volatile, restrict,
         matcher.type_size(db, pointee) if pointee is not None else None,
+        pointee,
     )
 
 
@@ -217,6 +261,206 @@ def _signature(matcher: Any, db: Any, index: int) -> ABISignature:
     )
 
 
+@dataclass(frozen=True)
+class ParameterHome:
+    """Where a parameter's value is at function entry.
+
+    ``stack_offset`` is relative to the entry ESP (the return address is at
+    offset 0). More than one location means the PDB admits several entry
+    ABIs; a caller must then provide, and a callee may read, each of them.
+    """
+
+    registers: tuple[str, ...] = ()
+    stack_offset: int | None = None
+
+    @property
+    def locations(self) -> int:
+        return len(self.registers) + (self.stack_offset is not None)
+
+
+def standard_parameter_homes(signature: ABISignature) -> tuple[ParameterHome, ...]:
+    """Entry homes implied by the declared 32-bit MSVC calling convention."""
+    convention = signature.calling_convention.lower()
+    fastcall = convention in ("nearfast", "nearfastcall", "fastcall")
+    thiscall = convention in ("thiscall", "nearthiscall")
+    registers = ["ecx", "edx"] if fastcall else []
+    homes: list[ParameterHome] = []
+    offset = 4
+    for index, parameter in enumerate(signature.parameters):
+        if thiscall and index == 0:
+            homes.append(ParameterHome(("ecx",)))
+        elif registers and parameter.size <= 4 and parameter.kind in ("integer", "pointer"):
+            homes.append(ParameterHome((registers.pop(0),)))
+        else:
+            homes.append(ParameterHome((), offset))
+            offset += (parameter.size + 3) & ~3
+    return tuple(homes)
+
+
+PARAMETER_RECORD = re.compile(r"^\s*\d+\s+\|\s+S_(REGISTER|BPREL32)\b")
+REGISTER_BODY = re.compile(r"register\s*=\s*(\w+),\s*type\s*=\s*`?0x([0-9A-Fa-f]+)")
+HOME_REGISTERS = {"eax", "ecx", "edx", "ebx", "esi", "edi"}
+
+
+def recorded_parameter_homes(
+    matcher: Any, tool: Path, pdb: Path, record: dict[str, Any],
+    signature: ABISignature, frame_prologue: bool,
+) -> tuple[tuple[ParameterHome, ...] | None, tuple[str, ...]]:
+    """Recover entry homes from a procedure's CodeView parameter records.
+
+    MSVC gives TU-local functions custom register conventions that their
+    procedure type does not describe; the parameter records do. They are
+    matched to the signature by type in order. The declared convention is
+    kept when the records agree with it, a custom layout is used when only
+    it fits, and a register parameter that fits both is given both homes.
+    Returns ``(None, ())`` for the declared convention.
+    """
+    standard = standard_parameter_homes(signature)
+    text = _module_symbols(str(tool), str(pdb), int(record["module"]))
+    lines = _procedure_block(text, int(record["record_offset"])).splitlines()
+    has_frame_pointer = bool(
+        (flags := PROCEDURE_FLAGS.search(" ".join(lines[:3]))) and "has fp" in flags.group(1)
+    )
+    records: list[tuple[str, int, str | int]] = []
+    for position, line in enumerate(lines[:-1]):
+        match = PARAMETER_RECORD.match(line)
+        if not match:
+            continue
+        body = lines[position + 1]
+        if match.group(1) == "REGISTER":
+            parsed = REGISTER_BODY.search(body)
+            if parsed:
+                records.append(("register", int(parsed.group(2), 16), parsed.group(1).lower()))
+        else:
+            parsed = BPREL_BODY.search(body)
+            if parsed:
+                records.append(("stack", int(parsed.group(1), 16), int(parsed.group(2))))
+    # Parameters are emitted first, in declaration order; unused ones may
+    # have no record. Match by exact type index.
+    recorded: list[tuple[str, str | int] | None] = []
+    cursor = 0
+    for parameter in signature.parameters:
+        if cursor < len(records) and records[cursor][1] == parameter.type_index:
+            recorded.append((records[cursor][0], records[cursor][2]))
+            cursor += 1
+        else:
+            recorded.append(None)
+    # Without a register record there is no sign of a custom convention.
+    if not any(item and item[0] == "register" for item in recorded):
+        return None, ()
+    if any(item and item[0] == "register" and item[1] not in HOME_REGISTERS for item in recorded):
+        return None, ("UNSUPPORTED_PDB_ABI:unexpected parameter register",)
+    if not (has_frame_pointer and frame_prologue):
+        # Stack records of a frame without the standard EBP prologue have no
+        # usable base. A register parameter after every stack parameter
+        # leaves both conventions with the same stack layout, so it is given
+        # both homes; anything else cannot be placed.
+        registers = [item[1] for item in recorded if item and item[0] == "register"]
+        on_stack = [
+            home.stack_offset is not None and not (item and item[0] == "register")
+            for home, item in zip(standard, recorded, strict=True)
+        ]
+        trailing = all(
+            not any(on_stack[index + 1:])
+            for index, (home, item) in enumerate(zip(standard, recorded, strict=True))
+            if item and item[0] == "register" and home.stack_offset is not None
+        )
+        if None in recorded or len(set(registers)) != len(registers) or not trailing:
+            return None, ("UNSUPPORTED_PDB_ABI:register parameters without an EBP frame",)
+        return tuple(
+            ParameterHome(tuple(dict.fromkeys((*home.registers, item[1]))), home.stack_offset)
+            if item[0] == "register" else home
+            for home, item in zip(standard, recorded, strict=True)
+        ), ()
+
+    # Declared convention: recorded stack homes must be the standard ones; a
+    # recorded register may merely be where the body keeps the value.
+    standard_fits = all(
+        item is None or item[0] == "register" or home.stack_offset == item[1] - 4
+        for home, item in zip(standard, recorded, strict=True)
+    )
+    # Custom convention: every parameter recorded, stack parameters packed
+    # from offset 4 in order, registers distinct.
+    custom_fits = None not in recorded
+    if custom_fits:
+        offset = 4
+        registers: set[str] = set()
+        for parameter, item in zip(signature.parameters, recorded, strict=True):
+            if item[0] == "stack":
+                custom_fits &= item[1] - 4 == offset
+                offset += (parameter.size + 3) & ~3
+            else:
+                custom_fits &= item[1] not in registers
+                registers.add(item[1])
+    if custom_fits and not standard_fits:
+        return tuple(
+            ParameterHome((item[1],)) if item[0] == "register" else ParameterHome((), item[1] - 4)
+            for item in recorded
+        ), ()
+    if standard_fits and custom_fits:
+        return tuple(
+            ParameterHome(tuple(dict.fromkeys((*home.registers, item[1]))), home.stack_offset)
+            if item[0] == "register" else home
+            for home, item in zip(standard, recorded, strict=True)
+        ), ()
+    if standard_fits:
+        return None, ()
+    return None, ("UNSUPPORTED_PDB_ABI:parameter records fit no entry convention",)
+
+
+BPREL_LOCAL = re.compile(r"^\s*\d+\s+\|\s+S_BPREL32\b.*`([^`]*)`\s*$")
+BPREL_BODY = re.compile(r"type\s*=\s*`?0x([0-9A-Fa-f]+).*\boffset\s*=\s*(-?\d+)")
+PROCEDURE_FLAGS = re.compile(r"\bflags\s*=\s*(.*)$")
+
+
+@dataclass(frozen=True)
+class FrameLocal:
+    name: str
+    frame_offset: int  # relative to EBP after `push ebp; mov ebp, esp`
+    size: int
+
+
+@dataclass(frozen=True)
+class FrameLayout:
+    """EBP-relative stack objects declared by a procedure's CodeView record.
+
+    ``complete`` is false when the record describes storage this parser does
+    not map (register-relative locals, a missing frame pointer, or an
+    unsized type); such objects are then left to conservative escape extents.
+    """
+
+    has_frame_pointer: bool
+    locals: tuple[FrameLocal, ...]
+    complete: bool
+
+
+def frame_layout(matcher: Any, tool: Path, pdb: Path, record: dict[str, Any]) -> FrameLayout:
+    text = _module_symbols(str(tool), str(pdb), int(record["module"]))
+    lines = _procedure_block(text, int(record["record_offset"])).splitlines()
+    header = " ".join(lines[:3])
+    flags = PROCEDURE_FLAGS.search(header)
+    has_frame_pointer = bool(flags and "has fp" in flags.group(1))
+    db = type_database(matcher, tool, pdb)
+    found: list[FrameLocal] = []
+    complete = has_frame_pointer
+    for position, line in enumerate(lines):
+        if re.search(r"\bS_(REGREL32|LOCAL|DEFRANGE\w*)\b", line):
+            complete = False
+        match = BPREL_LOCAL.match(line)
+        if not match or position + 1 >= len(lines):
+            continue
+        body = BPREL_BODY.search(lines[position + 1])
+        if body is None:
+            complete = False
+            continue
+        size = matcher.type_size(db, int(body.group(1), 16))
+        if not size:
+            complete = False
+            continue
+        found.append(FrameLocal(match.group(1), int(body.group(2)), size))
+    return FrameLayout(has_frame_pointer, tuple(found), complete)
+
+
 def extract_function_metadata(
     matcher: Any, tool: Path, pdb: Path, record: dict[str, Any],
     relocation_symbols: tuple[str, ...] = (),
@@ -230,7 +474,7 @@ def extract_function_metadata(
         if first_type is None:
             raise RuntimeError("procedure has no CodeView function type")
         function_index = int(first_type.group(1), 16)
-        db = matcher.TypeDB(list(_type_records(str(tool), str(pdb))))
+        db = type_database(matcher, tool, pdb)
         signature = _signature(matcher, db, function_index)
         block_lines = block.splitlines()
         typed: list[int] = []

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 import gc
 import hashlib
+import itertools
 import struct
 import time
 
@@ -28,12 +29,15 @@ from angr.sim_type import (
     SimTypePointer,
 )
 
-from pdb_frontend import ABISignature, ABIType
+from pdb_frontend import ABISignature, ABIType, ParameterHome, standard_parameter_homes
 
 
 BASE = 0x100000
 RETURN_SENTINEL = 0xF0000000
 STACK_BASE = 0x7FFF0000
+STACK_LOW = STACK_BASE - 0x100000
+# Largest symbolic-address range treated as a bounded table access.
+MAXIMUM_BOUNDED_REGION = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,11 @@ class CallTarget:
     signature: ABISignature | None = None
     frontend_issues: tuple[str, ...] = ()
     callsite_argument_counts: tuple[tuple[int, int], ...] = ()
+    # x87 stack entries the callee consumes (e.g. __ftol2_sse pops ST0).
+    x87_pops: int = 0
+    # Entry homes when they differ from the declared convention (MSVC custom
+    # conventions for TU-local functions); None means the declared one.
+    entry_homes: tuple[ParameterHome, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,11 @@ class Execution:
     readable_regions: tuple[tuple[object, int], ...] = ()
     signature: ABISignature | None = None
     stack_allocations: tuple[LogicalAllocation, ...] = ()
+    # The function's own bytes: readable, e.g. by in-function jump tables.
+    code_region: tuple[int, int] | None = None
+    # Callee-owned stack: locals, the return address and incoming arguments.
+    # Everything above belongs to the caller and is external memory.
+    private_stack: tuple[int, int] = (STACK_LOW, STACK_BASE + 4)
 
 
 class VerificationStatus(str, Enum):
@@ -89,6 +103,270 @@ class IncompleteVerification(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class CallEvent:
+    """One ordered, externally visible event of an execution.
+
+    ``escaped_memory`` holds callee-visible private stack bytes whose extent
+    is established by a declared allocation. ``uncertain`` holds values whose
+    observability depends on an unknown contract (an indirect call's register
+    arguments, bytes beyond a guessed escape extent). A difference there makes
+    the model incomplete instead of proving or refuting equivalence.
+    """
+
+    name: str
+    arguments: tuple[claripy.ast.BV, ...] = ()
+    snapshot: tuple[claripy.ast.BV, ...] = ()
+    pointer_mask: tuple[bool, ...] = ()
+    argument_memory: tuple[claripy.ast.BV | None, ...] = ()
+    escaped_memory: tuple[tuple[str, claripy.ast.BV], ...] = ()
+    uncertain: tuple[tuple[str, claripy.ast.BV], ...] = ()
+    # Touched undeclared bytes and the epoch whose symbols stand for the rest.
+    lazy_memory: tuple[tuple[int, claripy.ast.BV], ...] = ()
+    lazy_epoch: int = 0
+
+
+@dataclass(frozen=True)
+class EscapedRegion:
+    """Private stack bytes that external code can reach.
+
+    ``key`` is the logical identity shared by corresponding executions. A
+    ``definite`` region is a declared allocation; otherwise the extent is the
+    conservative distance from the escaping pointer to the end of its frame
+    area, keyed by where the pointer first escaped.
+    """
+
+    key: str
+    start: int
+    end: int
+    definite: bool
+
+
+_EXECUTION_TAGS = itertools.count()
+
+
+def _private_stack(state: angr.SimState) -> tuple[int, int]:
+    return state.globals.get("private_stack", (STACK_LOW, STACK_BASE + 4))
+
+
+def _stack_escape(state: angr.SimState, value: claripy.ast.BV,
+                  root: str) -> EscapedRegion | None:
+    """Return the private region reachable through ``value``, if any.
+
+    Only values that must address the private stack are escapes. Incoming
+    registers and other unconstrained inputs cannot point into a frame that
+    did not exist when the caller produced them.
+    """
+    if value.size() != 32:
+        return None
+    low, high = _private_stack(state)
+    if value.concrete:
+        address = value.concrete_value
+        if not low <= address < high:
+            return None
+    else:
+        if not _may_address_stack(state, value):
+            return None
+        inside = claripy.And(value >= low, value < high)
+        if not state.solver.is_true(inside):
+            return None
+        address = state.solver.min(value)
+        if state.solver.max(value) >= high:
+            return None
+    for region in state.globals.get("escaped", ()):
+        if region.start <= address < region.end:
+            return region
+    for allocation in state.globals.get("stack_allocations", ()):
+        if allocation.address <= address < allocation.address + allocation.size:
+            return EscapedRegion(
+                f"alloc:{allocation.logical_id}", allocation.address,
+                allocation.address + allocation.size, True,
+            )
+    end = STACK_BASE if address < STACK_BASE else high
+    return EscapedRegion(f"escape:{root}", address, end, False)
+
+
+def _add_escape(state: angr.SimState, region: EscapedRegion) -> None:
+    """Record ``region`` and every private region reachable from its words."""
+    pending = [region]
+    while pending:
+        current = pending.pop()
+        known = state.globals.get("escaped", ())
+        if any(item.key == current.key for item in known):
+            continue
+        state.globals["escaped"] = (*known, current)
+        # Pointers stored inside escaped memory escape with it.
+        for offset in range(0, (current.end - current.start) & ~3, 4):
+            word = state.memory.load(
+                current.start + offset, 4, endness=state.arch.memory_endness,
+                disable_actions=True, inspect=False,
+            )
+            if word.concrete:
+                nested = _stack_escape(state, word, f"{current.key}+{offset}")
+                if nested is not None:
+                    pending.append(nested)
+
+
+def _lazy_symbol(address: int, epoch: int) -> claripy.ast.BV:
+    return claripy.BVS(f"lazy_{address:x}_{epoch}", 8, explicit_name=True)
+
+
+def _outside_lazy_memory(state: angr.SimState, start: int, end: int) -> bool:
+    """True when [start, end) lies wholly in explicitly modeled storage."""
+    low, high = _private_stack(state)
+    if low <= start and end <= high:
+        return True
+    code_start, code_size = state.globals.get("code_region", (0, 0))
+    if code_start <= start and end <= code_start + code_size:
+        return True
+    return any(region_start <= start and end <= region_end
+               for region_start, region_end in state.globals.get("declared_ranges", ()))
+
+
+def _lazy_byte(state: angr.SimState, address: int) -> bool:
+    return not _outside_lazy_memory(state, address, address + 1)
+
+
+def _materialize_lazy(state: angr.SimState, address: int, length: int) -> None:
+    """Give never-touched undeclared bytes their shared, address-named value.
+
+    Named globals resolve to the same address on both sides, so a byte at a
+    concrete address is the same storage in both executions. Its value is a
+    symbol named by address and call epoch, identical on both sides, instead
+    of a declared object: nothing is modeled until it is touched.
+    """
+    if length <= 0 or _outside_lazy_memory(state, address, address + length):
+        return
+    live = state.globals.get("lazy_live", frozenset())
+    epoch = state.globals.get("lazy_epoch", 0)
+    new = [
+        byte for byte in range(address, address + length)
+        if byte not in live and _lazy_byte(state, byte)
+    ]
+    for byte in new:
+        state.memory.store(byte, _lazy_symbol(byte, epoch), inspect=False, disable_actions=True)
+    if new:
+        state.globals["lazy_live"] = live | frozenset(new)
+
+
+def _lazy_value(state: angr.SimState, byte: int, epoch: int | None = None) -> claripy.ast.BV:
+    """Current value of a lazily modeled byte, touched or not."""
+    if byte in state.globals.get("lazy_live", frozenset()):
+        return state.memory.load(byte, 1, inspect=False, disable_actions=True)
+    return _lazy_symbol(byte, state.globals.get("lazy_epoch", 0) if epoch is None else epoch)
+
+
+def _lazy_snapshot(state: angr.SimState) -> tuple[tuple[int, claripy.ast.BV], ...]:
+    return tuple(
+        (byte, state.memory.load(byte, 1, inspect=False, disable_actions=True))
+        for byte in sorted(state.globals.get("lazy_live", frozenset()))
+    )
+
+
+def _region_chunks(region: EscapedRegion):
+    size = region.end - region.start
+    for offset in range(0, size, 4):
+        yield offset, min(4, size - offset)
+
+
+def _escaped_observations(state: angr.SimState):
+    definite: list[tuple[str, claripy.ast.BV]] = []
+    uncertain: list[tuple[str, claripy.ast.BV]] = []
+    for region in state.globals.get("escaped", ()):
+        for offset, width in _region_chunks(region):
+            value = state.memory.load(
+                region.start + offset, width, endness=state.arch.memory_endness,
+            )
+            (definite if region.definite else uncertain).append(
+                (f"{region.key}:{offset}", value),
+            )
+    return tuple(definite), tuple(uncertain)
+
+
+def _havoc_escaped(state: angr.SimState, prefix: str) -> None:
+    for region in state.globals.get("escaped", ()):
+        for offset, width in _region_chunks(region):
+            state.memory.store(
+                region.start + offset,
+                claripy.BVS(f"{prefix}_{region.key}_{offset}", width * 8, explicit_name=True),
+                endness=state.arch.memory_endness,
+            )
+
+
+def _external_event(
+    state: angr.SimState, name: str, arguments: tuple[claripy.ast.BV, ...],
+    memory_regions: tuple[tuple[object, int], ...], *,
+    pointer_mask: tuple[bool, ...] = (),
+    pointee_sizes: tuple[int | None, ...] = (),
+    uncertain_registers: tuple[tuple[str, claripy.ast.BV], ...] = (),
+    havoc_memory: bool = True,
+) -> tuple[int, str]:
+    """Record an external call and apply its conservative effects.
+
+    The callee may read and write declared memory, every pointee it receives,
+    and every private stack region that has escaped so far. It also clobbers
+    the caller-saved registers ECX and EDX.
+    """
+    calls = state.globals.get("calls", ())
+    ordinal = len(calls)
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    pointer_mask = pointer_mask or tuple(False for _ in arguments)
+    pointee_sizes = pointee_sizes or tuple(None for _ in arguments)
+    if len(pointer_mask) != len(arguments) or len(pointee_sizes) != len(arguments):
+        raise ValueError(f"call summary for {name} has inconsistent pointer metadata")
+
+    # Any argument, typed or not, that addresses the private stack escapes.
+    for index, value in enumerate((*arguments, *(item for _, item in uncertain_registers))):
+        region = _stack_escape(state, value, f"{ordinal}.{index}")
+        if region is not None:
+            _add_escape(state, region)
+
+    snapshot = tuple(
+        state.memory.load(address, size, endness=state.arch.memory_endness)
+        for address, size in memory_regions
+    )
+    argument_memory = tuple(
+        state.memory.load(argument, size, endness=state.arch.memory_endness)
+        if is_pointer and size else None
+        for argument, is_pointer, size in zip(arguments, pointer_mask, pointee_sizes, strict=True)
+    )
+    escaped, guessed = _escaped_observations(state)
+    state.globals["calls"] = (*calls, CallEvent(
+        name, tuple(arguments), snapshot, tuple(pointer_mask), argument_memory,
+        escaped, (*uncertain_registers, *guessed),
+        _lazy_snapshot(state), state.globals.get("lazy_epoch", 0),
+    ))
+
+    if havoc_memory:
+        state.globals["inside_external_call"] = True
+        for index, (address, size) in enumerate(memory_regions):
+            state.memory.store(
+                address,
+                claripy.BVS(f"external_memory_{ordinal}_{index}_{digest}", size * 8,
+                            explicit_name=True),
+                endness=state.arch.memory_endness,
+            )
+        for index, (argument, is_pointer, size) in enumerate(zip(
+                arguments, pointer_mask, pointee_sizes, strict=True)):
+            if is_pointer and size:
+                state.memory.store(
+                    argument,
+                    claripy.BVS(f"external_pointee_{ordinal}_{index}_{digest}", size * 8,
+                                explicit_name=True),
+                    endness=state.arch.memory_endness,
+                )
+        _havoc_escaped(state, f"external_escaped_{ordinal}_{digest}")
+        # Every undeclared byte may have changed: start a new epoch.
+        state.globals["lazy_live"] = frozenset()
+        state.globals["lazy_epoch"] = state.globals.get("lazy_epoch", 0) + 1
+        state.globals["inside_external_call"] = False
+    for register in ("ecx", "edx"):
+        setattr(state.regs, register, claripy.BVS(
+            f"external_clobber_{ordinal}_{digest}_{register}", 32, explicit_name=True,
+        ))
+    return ordinal, digest
+
+
 class RecordedCall(angr.SimProcedure):
     def __init__(self, decorated_symbol: str, result: claripy.ast.BV,
                  argument_count: int, argument_registers: tuple[str, ...],
@@ -98,8 +376,16 @@ class RecordedCall(angr.SimProcedure):
                  argument_pointer_mask: tuple[bool, ...],
                  argument_pointee_sizes: tuple[int | None, ...],
                  callsite_argument_counts: tuple[tuple[int, int], ...],
+                 x87_pops: int = 0,
+                 homes: tuple[ParameterHome, ...] = (),
+                 widths: tuple[int, ...] = (),
                  cc=None, prototype=None):
-        super().__init__(num_args=argument_count, cc=cc, prototype=prototype)
+        # The prototype only describes the stack words the callee may pop
+        # and the return value; arguments are read from their entry homes.
+        super().__init__(num_args=len(prototype.args) if prototype else 0,
+                         cc=cc, prototype=prototype)
+        self.homes = homes
+        self.widths = widths
         self.decorated_symbol = decorated_symbol
         self.result = result
         self.argument_registers = argument_registers
@@ -110,63 +396,64 @@ class RecordedCall(angr.SimProcedure):
         self.argument_pointer_mask = argument_pointer_mask
         self.argument_pointee_sizes = argument_pointee_sizes
         self.callsite_argument_counts = dict(callsite_argument_counts)
+        self.x87_pops = x87_pops
 
-    def run(self, *arguments):  # type: ignore[no-untyped-def]
+    def _read_homes(self, count: int):
+        arguments: list[claripy.ast.BV] = []
+        uncertain: list[tuple[str, claripy.ast.BV]] = []
+        ambiguous: set[int] = set()
+        esp = self.state.regs.esp
+        for index, (home, width) in enumerate(zip(self.homes[:count], self.widths)):
+            values = [
+                (register, getattr(self.state.regs, register)[width - 1:0])
+                for register in home.registers
+            ]
+            if home.stack_offset is not None:
+                values.append((f"stack{home.stack_offset}", self.state.memory.load(
+                    esp + home.stack_offset, width // 8, endness=self.state.arch.memory_endness,
+                )))
+            if len(values) == 1:
+                arguments.append(values[0][1])
+                continue
+            # The PDB admits several entry ABIs: whichever the caller used,
+            # the others hold unrelated bytes. None is a definite observable.
+            ambiguous.add(index)
+            arguments.append(claripy.BVV(0, width))
+            uncertain.extend(
+                (f"ambiguous:{index}:{location}", value) for location, value in values
+            )
+        return tuple(arguments), tuple(uncertain), ambiguous
+
+    def run(self, *_):  # type: ignore[no-untyped-def]
+        callsite = self.state.callstack.call_site_addr
+        uncertain: tuple[tuple[str, claripy.ast.BV], ...] = ()
+        ambiguous: set[int] = set()
         if self.argument_registers:
             arguments = tuple(
                 x87_st0(self.state) if register == "x87_st0" else
                 getattr(self.state.regs, register)
                 for register in self.argument_registers
             )
-        callsite = self.state.callstack.call_site_addr
-        argument_count = self.callsite_argument_counts.get(callsite, len(arguments))
-        arguments = arguments[:argument_count]
-        calls = list(self.state.globals.get("calls", ()))
-        ordinal = len(calls)
-        snapshot = tuple(
-            self.state.memory.load(address, size, endness=self.state.arch.memory_endness)
-            for address, size in self.memory_regions
-        )
-        pointer_mask = (
-            self.argument_pointer_mask[:argument_count]
-            if self.argument_pointer_mask else tuple(False for _ in arguments)
-        )
+        else:
+            count = self.callsite_argument_counts.get(callsite, len(self.homes))
+            arguments, uncertain, ambiguous = self._read_homes(count)
+        argument_count = len(arguments)
+        pointer_mask = tuple(
+            flag and index not in ambiguous
+            for index, flag in enumerate(self.argument_pointer_mask[:argument_count])
+        ) if self.argument_pointer_mask else ()
         pointee_sizes = (
             self.argument_pointee_sizes[:argument_count]
-            if self.argument_pointee_sizes else tuple(None for _ in arguments)
+            if self.argument_pointee_sizes else ()
         )
-        if len(pointer_mask) != len(arguments) or len(pointee_sizes) != len(arguments):
-            raise ValueError(f"call summary for {self.decorated_symbol} has inconsistent pointer metadata")
-        argument_memory = tuple(
-            self.state.memory.load(argument, size, endness=self.state.arch.memory_endness)
-            if is_pointer and size else None
-            for argument, is_pointer, size in zip(arguments, pointer_mask, pointee_sizes, strict=True)
+        ordinal, digest = _external_event(
+            self.state, self.decorated_symbol, tuple(arguments), self.memory_regions,
+            pointer_mask=pointer_mask, pointee_sizes=pointee_sizes,
+            uncertain_registers=uncertain,
+            havoc_memory=self.havoc_memory,
         )
-        calls.append((
-            self.decorated_symbol, arguments, snapshot, pointer_mask,
-            argument_memory,
-        ))
-        self.state.globals["calls"] = tuple(calls)
-        digest = hashlib.sha256(self.decorated_symbol.encode("utf-8")).hexdigest()[:12]
-        if self.havoc_memory:
-            self.state.globals["inside_external_call"] = True
-            for index, (address, size) in enumerate(self.memory_regions):
-                value = claripy.BVS(
-                    f"external_memory_{ordinal}_{index}_{digest}", size * 8,
-                    explicit_name=True,
-                )
-                self.state.memory.store(address, value, endness=self.state.arch.memory_endness)
-            for index, (argument, is_pointer, size) in enumerate(zip(
-                    arguments, pointer_mask, pointee_sizes, strict=True)):
-                if is_pointer and size:
-                    value = claripy.BVS(
-                        f"external_pointee_{ordinal}_{index}_{digest}", size * 8,
-                        explicit_name=True,
-                    )
-                    self.state.memory.store(
-                        argument, value, endness=self.state.arch.memory_endness,
-                    )
-            self.state.globals["inside_external_call"] = False
+        for _ in range(self.x87_pops):
+            x87_pop(self.state)
         if self.fresh_result:
             result = claripy.BVS(
                 f"external_return_{ordinal}_{digest}", self.result.size(),
@@ -179,14 +466,7 @@ class RecordedCall(angr.SimProcedure):
         if self.return_register == "x87_st0":
             if result.size() != 64:
                 raise ValueError("an x87 call summary requires a 64-bit VEX F64 result")
-            new_top = (self.state.regs.ftop - 1) & 7
-            for index in range(8):
-                old_value = self.state.registers.load(72 + index * 8, 8)
-                self.state.registers.store(
-                    72 + index * 8,
-                    claripy.If(new_top == index, result, old_value),
-                )
-            self.state.regs.ftop = new_top
+            x87_push(self.state, result)
             return claripy.BVV(0, 32)
         if self.return_register == "edx_eax":
             if result.size() != 64:
@@ -199,27 +479,210 @@ class RecordedCall(angr.SimProcedure):
         raise ValueError(f"unsupported call return register: {self.return_register}")
 
 
+class UnmodeledPointerAccess(angr.errors.SimMemoryAddressError):
+    """A memory access through a pointer the model does not bound."""
+
+
+class _RejectUnboundedAddress(angr.concretization_strategies.SimConcretizationStrategy):
+    """Last concretization strategy: refuse instead of picking a value.
+
+    angr's defaults end with strategies that concretize an unconstrained
+    address to one arbitrary solver model and add that equality to the path.
+    The chosen model varies between runs and between the two executions, so
+    verdicts became nondeterministic. Accesses that no enumerating strategy
+    handled are reported as unmodeled instead.
+    """
+
+    def _concretize(self, memory, addr, **kwargs):
+        raise UnmodeledPointerAccess(f"unbounded symbolic address {addr}")
+
+
+def word_homes(sizes) -> tuple[ParameterHome, ...]:
+    """cdecl stack homes for untyped arguments of the given byte sizes."""
+    homes: list[ParameterHome] = []
+    offset = 4
+    for size in sizes:
+        homes.append(ParameterHome((), offset))
+        offset += (size + 3) & ~3
+    return tuple(homes)
+
+
+def _homes_with_varargs(homes: tuple[ParameterHome, ...], count: int) -> tuple[ParameterHome, ...]:
+    end = max((home.stack_offset + 4 for home in homes if home.stack_offset is not None), default=4)
+    extra = tuple(ParameterHome((), end + 4 * index) for index in range(count - len(homes)))
+    return (*homes, *extra)
+
+
+def _stack_bytes(homes, widths) -> int:
+    return max(
+        (home.stack_offset + ((width // 8 + 3) & ~3) - 4
+         for home, width in zip(homes, widths) if home.stack_offset is not None),
+        default=0,
+    )
+
+
 def project(code: bytes, base: int = BASE) -> angr.Project:
     return angr.load_shellcode(code, arch="x86", load_address=base)
 
 
-def _hook_fsin(state: angr.SimState) -> None:
-    """Model FSIN as a shared deterministic semantic operation."""
-    argument = x87_st0(state)
-    calls = list(state.globals.get("calls", ()))
-    ordinal = len(calls)
-    calls.append(("__x86_fsin", (argument,), (), (False,), (None,)))
-    state.globals["calls"] = tuple(calls)
-    result = claripy.BVS(
-        f"x86_fsin_result_{ordinal}", 64, explicit_name=True,
-    )
-    top = state.regs.ftop & 7
-    for index in range(8):
-        old_value = state.registers.load(72 + index * 8, 8)
+# VEX x86 guest state: eight F64 registers, one tag byte per register, and an
+# unmasked TOP counter that VEX reduces modulo 8 on every use.
+X87_REGISTERS = 72
+X87_TAGS = 136
+
+
+def _x87_physical(state: angr.SimState, depth: int) -> claripy.ast.BV:
+    return (state.regs.ftop + depth) & 7
+
+
+def x87_load(state: angr.SimState, depth: int = 0) -> claripy.ast.BV:
+    index = _x87_physical(state, depth)
+    values = [state.registers.load(X87_REGISTERS + item * 8, 8) for item in range(8)]
+    result = values[7]
+    for item in reversed(range(7)):
+        result = claripy.If(index == item, values[item], result)
+    return result
+
+
+def x87_store(state: angr.SimState, depth: int, value: claripy.ast.BV,
+              tag: int | None = None) -> None:
+    index = _x87_physical(state, depth)
+    for item in range(8):
+        selected = index == item
         state.registers.store(
-            72 + index * 8,
-            claripy.If(top == index, result, old_value),
+            X87_REGISTERS + item * 8,
+            claripy.If(selected, value, state.registers.load(X87_REGISTERS + item * 8, 8)),
         )
+        if tag is not None:
+            state.registers.store(
+                X87_TAGS + item,
+                claripy.If(selected, claripy.BVV(tag, 8),
+                           state.registers.load(X87_TAGS + item, 1)),
+            )
+
+
+def x87_push(state: angr.SimState, value: claripy.ast.BV) -> None:
+    state.regs.ftop = state.regs.ftop - 1
+    x87_store(state, 0, value, tag=1)
+
+
+def x87_pop(state: angr.SimState) -> None:
+    x87_store(state, 0, x87_load(state, 0), tag=0)
+    state.regs.ftop = state.regs.ftop + 1
+
+
+def x87_st0(state: angr.SimState) -> claripy.ast.BV:
+    return x87_load(state, 0)
+
+
+def pure_operation(state: angr.SimState, operation: str,
+                   arguments: tuple[claripy.ast.BV, ...],
+                   widths: tuple[int, ...]) -> tuple[claripy.ast.BV, ...]:
+    """Apply an uninterpreted deterministic operation.
+
+    Results are fresh symbols unique to this application. The verifier adds
+    functional-consistency constraints across every application in both
+    executions, so equal inputs yield equal outputs regardless of order.
+    """
+    tag = state.globals["execution_tag"]
+    application = next(state.globals["pure_counter"])
+    results = tuple(
+        claripy.BVS(f"pure_{operation}_{tag}_{application}_{index}", width,
+                    explicit_name=True)
+        for index, width in enumerate(widths)
+    )
+    state.globals["pure_operations"] = (
+        *state.globals.get("pure_operations", ()),
+        (operation, tuple(arguments), results),
+    )
+    return results
+
+
+def _x87_partial_trig(state: angr.SimState, value: claripy.ast.BV,
+                      result: claripy.ast.BV) -> claripy.ast.BV:
+    """Apply FSIN/FCOS/FSINCOS/FPTAN range reduction failure semantics.
+
+    For |x| >= 2**63 the instruction sets C2 and leaves the operand intact.
+    """
+    exponent = value[62:52]
+    out_of_range = claripy.And(exponent >= 0x43E, exponent != 0x7FF)
+    state.regs.fc3210 = claripy.If(
+        out_of_range, state.regs.fc3210 | 0x400, state.regs.fc3210 & 0xFFFFFBFF,
+    )
+    return claripy.If(out_of_range, value, result)
+
+
+def _x87_semantic(operation: str):
+    def hook(state: angr.SimState) -> None:
+        rounding = state.regs.fpround
+        top = x87_load(state, 0)
+        if operation in ("fsin", "fcos", "fsqrt", "f2xm1"):
+            (result,) = pure_operation(state, operation, (top, rounding), (64,))
+            if operation in ("fsin", "fcos"):
+                result = _x87_partial_trig(state, top, result)
+            x87_store(state, 0, result)
+        elif operation == "fsincos":
+            (sine,) = pure_operation(state, "fsin", (top, rounding), (64,))
+            (cosine,) = pure_operation(state, "fcos", (top, rounding), (64,))
+            reduced_sine = _x87_partial_trig(state, top, sine)
+            if state.solver.is_true((state.regs.fc3210 & 0x400) == 0):
+                x87_store(state, 0, reduced_sine)
+                x87_push(state, cosine)
+            else:
+                # Out of range: operand unchanged and nothing is pushed.
+                in_range = (state.regs.fc3210 & 0x400) == 0
+                x87_store(state, 0, reduced_sine)
+                state.regs.ftop = claripy.If(in_range, state.regs.ftop - 1, state.regs.ftop)
+                x87_store(state, 0, claripy.If(in_range, cosine, reduced_sine), tag=1)
+        elif operation == "fptan":
+            (tangent,) = pure_operation(state, operation, (top, rounding), (64,))
+            x87_store(state, 0, _x87_partial_trig(state, top, tangent))
+            x87_push(state, claripy.BVV(0x3FF0000000000000, 64))
+        elif operation in ("fpatan", "fyl2x", "fyl2xp1"):
+            (result,) = pure_operation(
+                state, operation, (x87_load(state, 1), top, rounding), (64,),
+            )
+            x87_store(state, 1, result)
+            x87_pop(state)
+        elif operation == "fscale":
+            (result,) = pure_operation(
+                state, operation, (top, x87_load(state, 1), rounding), (64,),
+            )
+            x87_store(state, 0, result)
+        else:
+            raise ValueError(f"unknown x87 semantic operation {operation}")
+    return hook
+
+
+# Two-byte x87 encodings that PyVEX lowers to IR operations angr cannot run.
+X87_SEMANTIC_OPERATIONS = {
+    b"\xd9\xfe": "fsin",
+    b"\xd9\xff": "fcos",
+    b"\xd9\xfb": "fsincos",
+    b"\xd9\xf2": "fptan",
+    b"\xd9\xf3": "fpatan",
+    b"\xd9\xf0": "f2xm1",
+    b"\xd9\xf1": "fyl2x",
+    b"\xd9\xf9": "fyl2xp1",
+    b"\xd9\xfd": "fscale",
+    b"\xd9\xfa": "fsqrt",
+}
+
+
+def _debugbreak(memory_regions: tuple[tuple[object, int], ...]):
+    def hook(state: angr.SimState) -> None:
+        # __debugbreak is an ordered observable event. Execution continues as
+        # it does when a debugger resumes; the memory it could inspect is part
+        # of the event.
+        state.globals["calls"] = (*state.globals.get("calls", ()), CallEvent(
+            "__debugbreak", (), tuple(
+                state.memory.load(address, size, endness=state.arch.memory_endness)
+                for address, size in memory_regions
+            ),
+            lazy_memory=_lazy_snapshot(state),
+            lazy_epoch=state.globals.get("lazy_epoch", 0),
+        ))
+    return hook
 
 
 def _indirect_target(state: angr.SimState, operand: tuple) -> claripy.ast.BV:
@@ -234,20 +697,25 @@ def _indirect_target(state: angr.SimState, operand: tuple) -> claripy.ast.BV:
     return state.memory.load(address, 4, endness=state.arch.memory_endness)
 
 
+def _scan(code: bytes, pattern: bytes):
+    # Linear disassembly can lose synchronization on embedded jump-table
+    # bytes, so hook every occurrence. Executed code reaches only genuine
+    # instruction boundaries; a hook inside another instruction is inert.
+    start = 0
+    while (offset := code.find(pattern, start)) >= 0:
+        yield offset
+        start = offset + 1
+
+
 def _install_semantic_instruction_hooks(
     proj: angr.Project, code: bytes, base: int,
     memory_regions: tuple[tuple[object, int], ...],
 ) -> None:
-    # Linear disassembly can lose synchronization on embedded jump-table
-    # bytes. FSIN has the exact two-byte encoding D9 FE, so scan every offset
-    # and let executed code reach only genuine instruction boundaries.
-    start = 0
-    while True:
-        offset = code.find(b"\xd9\xfe", start)
-        if offset < 0:
-            break
-        proj.hook(base + offset, _hook_fsin, length=2)
-        start = offset + 1
+    for pattern, operation in X87_SEMANTIC_OPERATIONS.items():
+        for offset in _scan(code, pattern):
+            proj.hook(base + offset, _x87_semantic(operation), length=len(pattern))
+    for offset in _scan(code, b"\xcc"):
+        proj.hook(base + offset, _debugbreak(memory_regions), length=1)
 
     engine = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     engine.detail = True
@@ -304,29 +772,15 @@ def _install_semantic_instruction_hooks(
                 )
                 for word in range(count)
             )
-            calls = list(state.globals.get("calls", ()))
-            ordinal = len(calls)
-            snapshot = tuple(
-                state.memory.load(address, size, endness=state.arch.memory_endness)
-                for address, size in memory_regions
+            # Without the function-pointer type, ECX and EDX may carry
+            # thiscall/fastcall arguments. They are compared as uncertain
+            # observables and may also carry escaping stack addresses.
+            ordinal, _ = _external_event(
+                state, "__indirect_call", (target, *arguments), memory_regions,
+                uncertain_registers=(
+                    ("register:ecx", state.regs.ecx), ("register:edx", state.regs.edx),
+                ),
             )
-            calls.append((
-                "__indirect_call", (target, *arguments), snapshot,
-                tuple(False for _ in range(count + 1)),
-                tuple(None for _ in range(count + 1)),
-            ))
-            state.globals["calls"] = tuple(calls)
-            state.globals["inside_external_call"] = True
-            for region_index, (address, size) in enumerate(memory_regions):
-                state.memory.store(
-                    address,
-                    claripy.BVS(
-                        f"indirect_memory_{ordinal}_{region_index}", size * 8,
-                        explicit_name=True,
-                    ),
-                    endness=state.arch.memory_endness,
-                )
-            state.globals["inside_external_call"] = False
             state.regs.eax = claripy.BVS(
                 f"indirect_return_{ordinal}", 32, explicit_name=True,
             )
@@ -390,9 +844,11 @@ def _prototype(proj: angr.Project, signature: ABISignature | None, count: int):
     return SimTypeFunction([word_type for _ in range(count)], word_type).with_arch(proj.arch)
 
 
-FP_ENVIRONMENT_INSTRUCTIONS = {
-    "fclex", "fnclex", "finit", "fninit", "fldcw", "fstcw", "fnstcw",
-    "ldmxcsr", "stmxcsr", "fxsave", "fxrstor", "xsave", "xrstor",
+# x87 instructions that neither VEX/angr nor a semantic hook can execute.
+# FPREM/FPREM1 report partial remainders through C2 and are normally looped.
+UNSUPPORTED_X87_INSTRUCTIONS = {
+    "fprem", "fprem1", "fxtract", "fxam", "fbld", "fbstp",
+    "fstenv", "fnstenv", "fldenv", "fsave", "fnsave", "frstor",
 }
 
 
@@ -403,8 +859,16 @@ def unsupported_instructions(code: bytes, base: int) -> tuple[str, ...]:
     consumed = 0
     for instruction in engine.disasm(code, base):
         consumed += instruction.size
-        if 0xF0 in instruction.prefix:
+        if 0xF0 in instruction.prefix or (
+                # XCHG with a memory operand is implicitly locked.
+                instruction.mnemonic == "xchg" and any(
+                    operand.type == capstone.x86_const.X86_OP_MEM
+                    for operand in instruction.operands)):
             issues.append(f"UNSUPPORTED_ATOMIC_INSTRUCTION:0x{instruction.address:x}")
+        if instruction.mnemonic in UNSUPPORTED_X87_INSTRUCTIONS:
+            issues.append(
+                f"UNSUPPORTED_X87_INSTRUCTION:{instruction.mnemonic}:0x{instruction.address:x}"
+            )
         # VEX models x87 control/status and MXCSR rounding state.  These are
         # initialized as shared inputs and compared as observable outputs.
         if instruction.mnemonic in ("int", "into", "ud2", "icebp"):
@@ -438,6 +902,7 @@ def execute(
     signature: ABISignature | None = None,
     frontend_issues: tuple[str, ...] = (),
     stack_allocations: tuple[LogicalAllocation, ...] = (),
+    entry_homes: tuple[ParameterHome, ...] | None = None,
 ) -> Execution:
     if frontend_issues:
         return Execution([], False, frontend_issues, constraints, (), signature, stack_allocations)
@@ -457,8 +922,27 @@ def execute(
                 signature, stack_allocations,
             )
         try:
-            target_cc = _calling_convention(proj, target.signature)
-            target_prototype = _prototype(proj, target.signature, target.argument_count)
+            if target.signature:
+                _prototype(proj, target.signature, target.argument_count)  # validates arity
+                homes = target.entry_homes or standard_parameter_homes(target.signature)
+                widths = tuple(item.size * 8 for item in target.signature.parameters)
+            else:
+                homes = word_homes((4,) * target.argument_count)
+                widths = ()
+            homes = _homes_with_varargs(homes, target.argument_count)
+            widths = (*widths, *(32,) * (len(homes) - len(widths)))
+            if any(home.registers and width > 32 for home, width in zip(homes, widths)):
+                raise ValueError("register parameter wider than 32 bits")
+            convention = (target.signature.calling_convention.lower()
+                          if target.signature else "nearc")
+            callee_cleanup = convention not in ("nearc", "cdecl", "nearvector")
+            target_cc = (angr.calling_conventions.SimCCStdcall(proj.arch) if callee_cleanup
+                         else angr.calling_conventions.SimCCMicrosoftCdecl(proj.arch))
+            word = SimTypeNum(32, signed=False).with_arch(proj.arch)
+            target_prototype = SimTypeFunction(
+                [word] * (_stack_bytes(homes, widths) // 4),
+                _sim_type(target.signature.return_type, proj.arch) if target.signature else word,
+            ).with_arch(proj.arch)
         except ValueError as error:
             return Execution(
                 [], False, (f"UNSUPPORTED_CALL_ABI:{target.decorated_symbol}:{error}",),
@@ -483,11 +967,10 @@ def execute(
             target.argument_registers, target.fresh_result,
             target.havoc_memory, memory_regions, target.return_register,
             pointer_mask, pointee_sizes, target.callsite_argument_counts,
-            target_cc, target_prototype,
+            target.x87_pops, homes, widths, target_cc, target_prototype,
         ))
 
     try:
-        cc = _calling_convention(proj, signature)
         if signature:
             if signature.variadic:
                 raise ValueError("variadic PDB signatures require explicit vararg types")
@@ -500,9 +983,14 @@ def execute(
                     raise ValueError(
                         f"argument {index} is {argument.size()} bits; PDB ABI requires {parameter.size * 8}"
                     )
-            prototype = _prototype(proj, signature, len(arguments))
+            homes = entry_homes or standard_parameter_homes(signature)
         else:
-            prototype = _prototype(proj, None, len(arguments))
+            homes = entry_homes or word_homes(argument.size() // 8 for argument in arguments)
+        if len(homes) != len(arguments):
+            raise ValueError("entry homes do not match the arguments")
+        if any(home.registers and argument.size() > 32
+               for home, argument in zip(homes, arguments)):
+            raise ValueError("register parameter wider than 32 bits")
     except ValueError as error:
         return Execution(
             [], False, (f"UNSUPPORTED_PDB_ABI:{error}",), constraints,
@@ -511,9 +999,8 @@ def execute(
         )
     state = proj.factory.call_state(
         base,
-        *arguments,
-        cc=cc,
-        prototype=prototype,
+        cc=angr.calling_conventions.SimCCMicrosoftCdecl(proj.arch),
+        prototype=SimTypeFunction([], SimTypeBottom(label="void")).with_arch(proj.arch),
         ret_addr=RETURN_SENTINEL,
         stack_base=STACK_BASE,
     )
@@ -522,20 +1009,38 @@ def execute(
     # process-global name allocator gives the two executions different symbols,
     # so even identical `ret` functions can appear to return different EAX
     # values.  Explicit names also make proofs independent of exploration and
-    # test order.  ESP/EIP are established by call_state, and explicit ABI
-    # register arguments below intentionally override these defaults.
-    abi_registers = {
-        location.reg_name
-        for location in cc.arg_locs(prototype)
-        if hasattr(location, "reg_name")
-    }
+    # test order.  ESP/EIP are established by call_state; parameter homes
+    # below override these defaults.
     for register in ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"):
-        if register in abi_registers:
-            continue
         setattr(
             state.regs, register,
             claripy.BVS(f"incoming_{register}", 32, explicit_name=True),
         )
+    # Place every argument in each of its entry homes. Bits a narrow value
+    # does not define are shared, unconstrained garbage.
+    argument_end = 4
+    for argument, home in zip(arguments, homes, strict=True):
+        width = argument.size()
+        for register in home.registers:
+            setattr(state.regs, register, argument if width == 32 else claripy.Concat(
+                claripy.BVS(f"incoming_{register}_upper", 32 - width, explicit_name=True),
+                argument,
+            ))
+        if home.stack_offset is not None:
+            address = STACK_BASE + home.stack_offset
+            state.memory.store(address, argument, endness=proj.arch.memory_endness)
+            slot = (width // 8 + 3) & ~3
+            if slot > width // 8:
+                state.memory.store(
+                    address + width // 8,
+                    claripy.BVS(f"incoming_stack_padding_{home.stack_offset}",
+                                (slot - width // 8) * 8, explicit_name=True),
+                )
+            argument_end = max(argument_end, home.stack_offset + slot)
+    # The callee owns its frame, the return-address slot and its incoming
+    # argument slots. Bytes above the arguments belong to the caller.
+    private_stack = (STACK_LOW, STACK_BASE + argument_end)
+    code_region = (base, len(code))
     state.regs.cc_op = claripy.BVV(0, 32)
     state.regs.cc_dep1 = claripy.BVS("incoming_eflags", 32, explicit_name=True)
     state.regs.cc_dep2 = claripy.BVV(0, 32)
@@ -564,6 +1069,13 @@ def execute(
     state.regs.sseround = claripy.BVS("incoming_sseround", 32, explicit_name=True)
     state.globals["calls"] = ()
     state.globals["stack_allocations"] = stack_allocations
+    state.globals["private_stack"] = private_stack
+    state.globals["escaped"] = ()
+    state.globals["execution_tag"] = next(_EXECUTION_TAGS)
+    # Shared (not copied) by every path of this execution, so each pure
+    # operation application receives a unique result symbol.
+    state.globals["pure_counter"] = itertools.count()
+    state.globals["pure_operations"] = ()
     state.solver.add(*constraints)
     for register, value in initial_registers:
         setattr(state.regs, register, value)
@@ -573,14 +1085,13 @@ def execute(
     allocation_ranges: list[tuple[int, int]] = []
     for allocation in stack_allocations:
         if (allocation.logical_id in allocation_ids or allocation.size <= 0 or
-                not STACK_BASE - 0x100000 <= allocation.address or
-                allocation.address + allocation.size > STACK_BASE + 0x10000 or
+                not private_stack[0] <= allocation.address or
+                allocation.address + allocation.size > private_stack[1] or
                 any(allocation.address < end and start < allocation.address + allocation.size
                     for start, end in allocation_ranges)):
             return Execution(
                 [], False, (f"UNMODELED_STACK_ALLOCATION:{allocation.logical_id}",),
-                initialized_constraints if 'initialized_constraints' in locals() else constraints,
-                memory_regions, signature, stack_allocations,
+                constraints, memory_regions, signature, stack_allocations,
             )
         allocation_ids.add(allocation.logical_id)
         allocation_ranges.append((allocation.address, allocation.address + allocation.size))
@@ -593,15 +1104,32 @@ def execute(
             ),
             endness=proj.arch.memory_endness,
         )
-    state.globals["memory_reads"] = ()
-    state.globals["memory_writes"] = ()
+    state.globals["memory_reads"] = None
+    state.globals["memory_writes"] = None
+    state.globals["code_region"] = code_region
+    state.globals["declared_ranges"] = tuple(sorted(
+        (address, address + value.size() // 8) for address, value in initial_memory
+    ))
+    state.globals["lazy_live"] = frozenset()
+    state.globals["lazy_epoch"] = 0
+    state.memory.read_strategies = [
+        angr.concretization_strategies.SimConcretizationStrategyRange(1024),
+        _RejectUnboundedAddress(),
+    ]
+    state.memory.write_strategies = [
+        angr.concretization_strategies.SimConcretizationStrategyRange(128),
+        _RejectUnboundedAddress(),
+    ]
 
     def record_read(current: angr.SimState) -> None:
         address = current.inspect.attrs.mem_read_address
         length = current.inspect.attrs.mem_read_length
         if address is not None and length is not None:
+            size = _as_length(length)
+            if getattr(address, "concrete", False) and size is not None:
+                _materialize_lazy(current, address.concrete_value, size)
             current.globals["memory_reads"] = (
-                *current.globals.get("memory_reads", ()), (address, length),
+                (address, length), current.globals.get("memory_reads"),
             )
 
     def record_write(current: angr.SimState) -> None:
@@ -610,8 +1138,12 @@ def execute(
         address = current.inspect.attrs.mem_write_address
         length = current.inspect.attrs.mem_write_length
         if address is not None and length is not None:
+            size = _as_length(length)
+            if getattr(address, "concrete", False) and size is not None:
+                # Materialize first so a partial write overlays the shared value.
+                _materialize_lazy(current, address.concrete_value, size)
             current.globals["memory_writes"] = (
-                *current.globals.get("memory_writes", ()), (address, length),
+                (address, length), current.globals.get("memory_writes"),
             )
 
     state.inspect.b("mem_read", when=angr.BP_BEFORE, action=record_read)
@@ -651,6 +1183,8 @@ def execute(
         steps += 1
         if manager.errored:
             issues.extend(
+                "UNMODELED_POINTER_ACCESS"
+                if isinstance(item.error, UnmodeledPointerAccess) else
                 f"EXECUTION_ERROR:{type(item.error).__name__}:{item.error}"
                 for item in manager.errored[:8]
             )
@@ -669,6 +1203,7 @@ def execute(
     return Execution(
         list(manager.returned), not issues, tuple(dict.fromkeys(issues)),
         initialized_constraints, memory_regions, signature, stack_allocations,
+        code_region, private_stack,
     )
 
 
@@ -676,67 +1211,199 @@ def path_condition(state: angr.SimState) -> claripy.ast.Bool:
     return claripy.And(*state.solver.constraints)
 
 
-def _logical_pointer(
-    state: angr.SimState, value: claripy.ast.BV,
-) -> tuple[str, str, int] | tuple[str, claripy.ast.BV]:
-    if state.solver.unique(value):
+class _Differences:
+    """Definite observable differences plus differences whose observability
+    depends on an unknown contract, grouped by the missing contract."""
+
+    def __init__(self) -> None:
+        self.definite: list[claripy.ast.Bool] = []
+        self.uncertain: dict[str, list[claripy.ast.Bool]] = {}
+
+    def add(self, difference: claripy.ast.Bool) -> None:
+        self.definite.append(difference)
+
+    def maybe(self, kind: str, difference: claripy.ast.Bool) -> None:
+        self.uncertain.setdefault(kind, []).append(difference)
+
+
+def _may_address_stack(state: angr.SimState, value: claripy.ast.BV) -> bool:
+    """Cheap structural test before asking the solver.
+
+    ESP is concrete, so a symbolic expression can only denote a private stack
+    address when it is built from a constant in the private stack range.
+    """
+    low, high = _private_stack(state)
+    return any(
+        leaf.op == "BVV" and low <= leaf.args[0] < high
+        for leaf in value.leaf_asts()
+    )
+
+
+def _logical_pointer(state: angr.SimState, value: claripy.ast.BV) -> tuple:
+    """Map a private stack address to allocation identity plus offset."""
+    if value.size() != 32:
+        return ("raw", value)
+    if value.concrete:
+        concrete = value.concrete_value
+    elif not _may_address_stack(state, value) or not state.solver.unique(value):
+        return ("raw", value)
+    else:
         concrete = state.solver.eval(value)
-        for allocation in state.globals.get("stack_allocations", ()):
-            if allocation.address <= concrete < allocation.address + allocation.size:
-                return ("allocation", allocation.logical_id, concrete - allocation.address)
-    return ("raw", value)
+    low, high = _private_stack(state)
+    if not low <= concrete < high:
+        return ("raw", value)
+    for allocation in state.globals.get("stack_allocations", ()):
+        if allocation.address <= concrete < allocation.address + allocation.size:
+            return ("allocation", allocation.logical_id, concrete - allocation.address)
+    for region in state.globals.get("escaped", ()):
+        if region.start <= concrete < region.end:
+            return ("escape", region.key, concrete - region.start)
+    return ("stack", concrete)
+
+
+def _compare_values(
+    differences: _Differences,
+    left_state: angr.SimState, left: claripy.ast.BV,
+    right_state: angr.SimState, right: claripy.ast.BV,
+) -> None:
+    """Compare values that may be private stack addresses.
+
+    Stack layouts are not observable, so such addresses are compared by
+    logical identity. An address inside no known object has no identity.
+    """
+    if left.size() != right.size():
+        differences.add(claripy.true())
+        return
+    lhs = _logical_pointer(left_state, left)
+    rhs = _logical_pointer(right_state, right)
+    if lhs[0] == "raw" and rhs[0] == "raw":
+        differences.add(left != right)
+    elif lhs[0] == "stack" or rhs[0] == "stack":
+        differences.maybe("UNIDENTIFIED_STACK_ADDRESS", claripy.true())
+    else:
+        differences.add(claripy.BoolV(lhs != rhs))
 
 
 def _pointer_difference(
     left_state: angr.SimState, left: claripy.ast.BV,
     right_state: angr.SimState, right: claripy.ast.BV,
 ) -> claripy.ast.Bool:
-    lhs = _logical_pointer(left_state, left)
-    rhs = _logical_pointer(right_state, right)
-    if lhs[0] == "allocation" or rhs[0] == "allocation":
-        return claripy.BoolV(lhs != rhs)
-    return lhs[1] != rhs[1]
+    differences = _Differences()
+    _compare_values(differences, left_state, left, right_state, right)
+    return _or(differences.definite + sum(differences.uncertain.values(), []))
 
 
-def calls_differ(left: angr.SimState, right: angr.SimState) -> claripy.ast.Bool:
+_UNCERTAIN_KINDS = {
+    "register": "INDIRECT_CALL_REGISTER_ARGUMENTS",
+    "ambiguous": "AMBIGUOUS_PARAMETER_HOME",
+    "escape": "ESCAPED_STACK_EXTENT_UNKNOWN",
+}
+
+
+def calls_differ(left: angr.SimState, right: angr.SimState,
+                 differences: _Differences | None = None) -> claripy.ast.Bool:
+    """Compare ordered external events; return the definite difference."""
+    differences = differences if differences is not None else _Differences()
     lhs = left.globals.get("calls", ())
     rhs = right.globals.get("calls", ())
     if len(lhs) != len(rhs):
+        differences.add(claripy.true())
         return claripy.true()
-
-    differences: list[claripy.ast.Bool] = []
     for lhs_call, rhs_call in zip(lhs, rhs, strict=True):
-        lhs_name, lhs_args, lhs_memory, lhs_pointers, lhs_argument_memory = lhs_call
-        rhs_name, rhs_args, rhs_memory, rhs_pointers, rhs_argument_memory = rhs_call
-        if lhs_name != rhs_name:
-            return claripy.true()
-        if len(lhs_args) != len(rhs_args) or lhs_pointers != rhs_pointers:
-            return claripy.true()
-        differences.extend(
-            _pointer_difference(left, lhs_arg, right, rhs_arg)
-            if is_pointer else lhs_arg != rhs_arg
-            for lhs_arg, rhs_arg, is_pointer in zip(
-                lhs_args, rhs_args, lhs_pointers, strict=True,
-            )
-        )
-        if len(lhs_memory) != len(rhs_memory):
-            return claripy.true()
-        differences.extend(
-            lhs_value != rhs_value
-            for lhs_value, rhs_value in zip(lhs_memory, rhs_memory, strict=True)
-        )
-        differences.extend(
-            claripy.BoolV((lhs_value is None) != (rhs_value is None))
-            if lhs_value is None or rhs_value is None else lhs_value != rhs_value
-            for lhs_value, rhs_value in zip(
-                lhs_argument_memory, rhs_argument_memory, strict=True,
-            )
-        )
-    return claripy.Or(*differences) if differences else claripy.false()
+        if (lhs_call.name != rhs_call.name or
+                len(lhs_call.arguments) != len(rhs_call.arguments) or
+                lhs_call.pointer_mask != rhs_call.pointer_mask or
+                len(lhs_call.snapshot) != len(rhs_call.snapshot)):
+            differences.add(claripy.true())
+            continue
+        for lhs_value, rhs_value in zip(lhs_call.arguments, rhs_call.arguments, strict=True):
+            _compare_values(differences, left, lhs_value, right, rhs_value)
+        for lhs_value, rhs_value in zip(lhs_call.snapshot, rhs_call.snapshot, strict=True):
+            differences.add(lhs_value != rhs_value)
+        for lhs_value, rhs_value in zip(
+                lhs_call.argument_memory, rhs_call.argument_memory, strict=True):
+            if lhs_value is None or rhs_value is None:
+                differences.add(claripy.BoolV((lhs_value is None) != (rhs_value is None)))
+            elif lhs_value.size() != rhs_value.size():
+                differences.add(claripy.true())
+            else:
+                differences.add(lhs_value != rhs_value)
+        lhs_escaped = dict(lhs_call.escaped_memory)
+        rhs_escaped = dict(rhs_call.escaped_memory)
+        for key in lhs_escaped.keys() & rhs_escaped.keys():
+            _compare_values(differences, left, lhs_escaped[key], right, rhs_escaped[key])
+        if lhs_escaped.keys() != rhs_escaped.keys():
+            differences.maybe("ESCAPED_OBJECT_EXTENT_MISMATCH", claripy.true())
+        _compare_lazy(differences, left, lhs_call.lazy_memory, lhs_call.lazy_epoch,
+                      right, rhs_call.lazy_memory, rhs_call.lazy_epoch)
+        lhs_uncertain = dict(lhs_call.uncertain)
+        rhs_uncertain = dict(rhs_call.uncertain)
+        for key in lhs_uncertain.keys() | rhs_uncertain.keys():
+            kind = _UNCERTAIN_KINDS.get(key.split(":", 1)[0], "UNCERTAIN_OBSERVABLE")
+            if key in lhs_uncertain and key in rhs_uncertain:
+                lhs_value, rhs_value = lhs_uncertain[key], rhs_uncertain[key]
+                differences.maybe(
+                    kind,
+                    lhs_value != rhs_value if lhs_value.size() == rhs_value.size()
+                    else claripy.true(),
+                )
+            else:
+                differences.maybe(kind, claripy.true())
+    return _or(differences.definite)
+
+
+def _compare_lazy(differences: _Differences,
+                  left: angr.SimState, lhs: tuple, lhs_epoch: int,
+                  right: angr.SimState, rhs: tuple, rhs_epoch: int) -> None:
+    """Compare lazily modeled bytes touched by either side.
+
+    A byte one side never touched in this epoch still holds that epoch's
+    shared symbol there.
+    """
+    lhs_values, rhs_values = dict(lhs), dict(rhs)
+    for byte in sorted(lhs_values.keys() | rhs_values.keys()):
+        left_value = lhs_values.get(byte, _lazy_symbol(byte, lhs_epoch))
+        right_value = rhs_values.get(byte, _lazy_symbol(byte, rhs_epoch))
+        differences.add(left_value != right_value)
+
+
+def _pure_applications(states) -> list[tuple[str, tuple, tuple]]:
+    unique: dict[str, tuple[str, tuple, tuple]] = {}
+    for state in states:
+        for application in state.globals.get("pure_operations", ()):
+            unique.setdefault(application[2][0].args[0], application)
+    return list(unique.values())
+
+
+def functional_consistency(states) -> claripy.ast.Bool:
+    """Ackermann constraints: equal pure-operation inputs give equal outputs."""
+    applications = _pure_applications(states)
+    constraints: list[claripy.ast.Bool] = []
+    for index, (operation, arguments, results) in enumerate(applications):
+        for other_operation, other_arguments, other_results in applications[index + 1:]:
+            if operation != other_operation or len(arguments) != len(other_arguments):
+                continue
+            constraints.append(claripy.Or(
+                *(left != right for left, right in zip(arguments, other_arguments)),
+                claripy.And(*(left == right for left, right in zip(results, other_results))),
+            ))
+    return claripy.And(*constraints) if constraints else claripy.true()
 
 
 def _or(values: list[claripy.ast.Bool]) -> claripy.ast.Bool:
     return claripy.Or(*values) if values else claripy.false()
+
+
+def access_log(state: angr.SimState, key: str):
+    """Recorded (address, length) accesses, newest first.
+
+    Logs are immutable linked lists: appending is O(1) and forked paths share
+    their common prefix instead of copying a tuple on every access.
+    """
+    node = state.globals.get(key)
+    while node is not None:
+        yield node[0]
+        node = node[1]
 
 
 def _as_length(value: object) -> int | None:
@@ -758,25 +1425,42 @@ def _access_model_issues(
     observed_memory: tuple[tuple[int, int], ...],
 ) -> tuple[str, ...]:
     issues: list[str] = []
-    stack_regions: tuple[tuple[object, int], ...] = ((STACK_BASE - 0x100000, 0x110000),)
-    readable = execution.readable_regions + stack_regions
+    low, high = execution.private_stack
+    stack_regions: tuple[tuple[object, int], ...] = ((low, high - low),)
+    code_regions = (execution.code_region,) if execution.code_region else ()
+    readable = execution.readable_regions + stack_regions + code_regions
     writable: tuple[tuple[object, int], ...] = tuple(observed_memory) + stack_regions
     for state in execution.states:
-        condition = path_condition(state)
+        # One solver per path; each access is an extra-constraint query.
+        solver = None
+        checked: set[tuple] = set()
         for kind, regions in (("READ", readable), ("WRITE", writable)):
-            accesses = state.globals.get(f"memory_{kind.lower()}s", ())
+            accesses = access_log(state, f"memory_{kind.lower()}s")
             for address, raw_length in accesses:
                 length = _as_length(raw_length)
                 if length is None:
                     issues.append(f"SYMBOLIC_{kind}_SIZE")
                     continue
+                # Concrete undeclared addresses are modeled lazily by address,
+                # except that the function's own code is not writable.
+                if getattr(address, "concrete", False):
+                    start = address.concrete_value
+                    code_start, code_size = execution.code_region or (0, 0)
+                    if not (kind == "WRITE" and start < code_start + code_size and
+                            code_start < start + length):
+                        continue
+                key = (kind, address.hash() if hasattr(address, "hash") else address, length)
+                if key in checked:
+                    continue
+                checked.add(key)
                 covered = _or([
                     _inside_region(address, length, start, size)
                     for start, size in regions
                 ])
-                solver = claripy.Solver()
-                solver.add(claripy.And(condition, claripy.Not(covered)))
-                if solver.satisfiable():
+                if solver is None:
+                    solver = claripy.Solver()
+                    solver.add(path_condition(state))
+                if solver.satisfiable(extra_constraints=(claripy.Not(covered),)):
                     issues.append(f"UNMODELED_EXTERNAL_{kind}")
     return tuple(dict.fromkeys(issues))
 
@@ -784,7 +1468,7 @@ def _access_model_issues(
 def bounded_external_regions(
     executions: tuple[Execution, ...],
     known_regions: tuple[tuple[int, int], ...] = (),
-    maximum_region_size: int = 1 << 20,
+    maximum_region_size: int = MAXIMUM_BOUNDED_REGION,
 ) -> tuple[tuple[int, int], ...]:
     """Discover finite concrete ranges behind symbolic memory accesses.
 
@@ -792,15 +1476,23 @@ def bounded_external_regions(
     whose 32-bit range would exceed the cap and remains model-incomplete.
     """
     discovered: list[tuple[int, int]] = []
-    stack_start, stack_size = STACK_BASE - 0x100000, 0x110000
-    known = (*known_regions, (stack_start, stack_size))
+    known = list(known_regions)
+    for execution in executions:
+        low, high = execution.private_stack
+        known.append((low, high - low))
+        # Reads of the function's own bytes (jump tables) are modeled by the
+        # code itself; declaring them as symbolic memory would erase them.
+        if execution.code_region:
+            known.append(execution.code_region)
     for execution in executions:
         for state in execution.states:
             for kind in ("reads", "writes"):
-                for address, raw_length in state.globals.get(f"memory_{kind}", ()):
+                for address, raw_length in access_log(state, f"memory_{kind}"):
                     length = _as_length(raw_length)
                     if length is None:
                         continue
+                    if getattr(address, "concrete", False):
+                        continue  # modeled lazily by address
                     try:
                         lower = state.solver.min(address)
                         upper = state.solver.max(address)
@@ -822,15 +1514,6 @@ def bounded_external_regions(
         else:
             merged.append((start, size))
     return tuple(merged)
-
-
-def x87_st0(state: angr.SimState) -> claripy.ast.BV:
-    top = state.regs.ftop & 7
-    values = [state.registers.load(72 + index * 8, 8) for index in range(8)]
-    result = values[-1]
-    for index in reversed(range(7)):
-        result = claripy.If(top == index, values[index], result)
-    return result
 
 
 def verify_equivalence(
@@ -890,6 +1573,7 @@ def verify_equivalence(
 
     assumptions = claripy.And(
         *reference.initial_constraints, *candidate.initial_constraints,
+        functional_consistency((*reference.states, *candidate.states)),
     )
     reference_coverage = _or([path_condition(state) for state in reference.states])
     candidate_coverage = _or([path_condition(state) for state in candidate.states])
@@ -911,60 +1595,78 @@ def verify_equivalence(
             reasons=("RETURN_COVERAGE_INCOMPLETE",),
         )
 
+    if return_register not in ("eax", "x87_st0", "edx_eax"):
+        return VerificationResult(
+            VerificationStatus.UNSUPPORTED,
+            reasons=(f"UNSUPPORTED_RETURN_REGISTER:{return_register}",),
+        )
     solver = claripy.Solver()
     mismatches: list[claripy.ast.Bool] = []
+    uncertain: dict[str, list[claripy.ast.Bool]] = {}
     for lhs in reference.states:
         for rhs in candidate.states:
             shared_path = claripy.And(path_condition(lhs), path_condition(rhs))
-            differences = [calls_differ(lhs, rhs)]
-            differences.extend((
+            differences = _Differences()
+            calls_differ(lhs, rhs, differences)
+            # Stale x87 condition codes (C0-C3) are not part of the contract;
+            # VEX keeps TOP unreduced, so compare it modulo the stack size.
+            for difference in (
                 lhs.regs.fptag != rhs.regs.fptag,
                 lhs.regs.fpround != rhs.regs.fpround,
-                lhs.regs.fc3210 != rhs.regs.fc3210,
-                lhs.regs.ftop != rhs.regs.ftop,
+                (lhs.regs.ftop & 7) != (rhs.regs.ftop & 7),
                 lhs.regs.sseround != rhs.regs.sseround,
-            ))
+            ):
+                differences.add(difference)
             if compare_return:
                 if return_register == "eax":
                     lhs_return = lhs.regs.eax[return_bits - 1:0]
                     rhs_return = rhs.regs.eax[return_bits - 1:0]
-                    differences.append(
-                        _pointer_difference(lhs, lhs_return, rhs, rhs_return)
-                        if return_pointer else lhs_return != rhs_return
-                    )
+                    if return_pointer:
+                        _compare_values(differences, lhs, lhs_return, rhs, rhs_return)
+                    else:
+                        differences.add(lhs_return != rhs_return)
                 elif return_register == "x87_st0":
-                    differences.append(x87_st0(lhs) != x87_st0(rhs))
-                elif return_register == "edx_eax":
-                    differences.append(
+                    differences.add(x87_st0(lhs) != x87_st0(rhs))
+                else:
+                    differences.add(
                         claripy.Concat(lhs.regs.edx, lhs.regs.eax) !=
                         claripy.Concat(rhs.regs.edx, rhs.regs.eax)
                     )
-                else:
-                    return VerificationResult(
-                        VerificationStatus.UNSUPPORTED,
-                        reasons=(f"UNSUPPORTED_RETURN_REGISTER:{return_register}",),
-                    )
-            differences.extend(
-                lhs.memory.load(address, size, endness=lhs.arch.memory_endness) !=
-                rhs.memory.load(address, size, endness=rhs.arch.memory_endness)
-                for address, size in observed_memory
+            _compare_lazy(
+                differences,
+                lhs, _lazy_snapshot(lhs), lhs.globals.get("lazy_epoch", 0),
+                rhs, _lazy_snapshot(rhs), rhs.globals.get("lazy_epoch", 0),
             )
-            differences.extend(
-                _pointer_difference(
-                    lhs,
-                    lhs.memory.load(address, size, endness=lhs.arch.memory_endness),
-                    rhs,
-                    rhs.memory.load(address, size, endness=rhs.arch.memory_endness),
+            for address, size in observed_memory:
+                differences.add(
+                    lhs.memory.load(address, size, endness=lhs.arch.memory_endness) !=
+                    rhs.memory.load(address, size, endness=rhs.arch.memory_endness)
                 )
-                for address, size in pointer_observations
-            )
-            mismatches.append(claripy.And(shared_path, claripy.Or(*differences)))
+            for address, size in pointer_observations:
+                _compare_values(
+                    differences,
+                    lhs, lhs.memory.load(address, size, endness=lhs.arch.memory_endness),
+                    rhs, rhs.memory.load(address, size, endness=rhs.arch.memory_endness),
+                )
+            mismatches.append(claripy.And(shared_path, _or(differences.definite)))
+            for kind, values in differences.uncertain.items():
+                uncertain.setdefault(kind, []).append(claripy.And(shared_path, _or(values)))
     solver.add(claripy.And(assumptions, _or(mismatches)))
     if solver.satisfiable():
         return VerificationResult(
             VerificationStatus.NOT_EQUIVALENT,
             tuple(solver.eval(value, 1)[0] for value in inputs),
         )
+    # No definite difference exists. A possible difference in an observable
+    # whose contract is unknown leaves the model incomplete, never equivalent.
+    unresolved = []
+    for kind, values in sorted(uncertain.items()):
+        uncertain_solver = claripy.Solver()
+        uncertain_solver.add(claripy.And(assumptions, _or(values)))
+        if uncertain_solver.satisfiable():
+            unresolved.append(kind)
+    if unresolved:
+        return VerificationResult(VerificationStatus.MODEL_INCOMPLETE, reasons=tuple(unresolved))
     return VerificationResult(VerificationStatus.EQUIVALENT)
 
 
@@ -992,6 +1694,10 @@ def counterexample(
     return result.counterexample
 
 
+# Executions per alias case while undeclared bounded regions keep appearing.
+DISCOVERY_ROUNDS = 6
+
+
 def verify_under_pdb_aliasing(
     reference_code: bytes,
     candidate_code: bytes,
@@ -1005,42 +1711,63 @@ def verify_under_pdb_aliasing(
     reference_base: int = BASE,
     candidate_base: int = BASE,
     frontend_issues: tuple[str, ...] = (),
-    maximum_cases: int = 4096,
+    maximum_cases: int | None = 4096,
     global_objects: tuple[object, ...] = (),
     pointer_globals: tuple[object, ...] = (),
     execute_options: dict[str, object] | None = None,
     total_timeout_seconds: float | None = None,
+    reference_stack_allocations: tuple[LogicalAllocation, ...] = (),
+    candidate_stack_allocations: tuple[LogicalAllocation, ...] = (),
+    placements=None,
+    reference_entry_homes: tuple[ParameterHome, ...] | None = None,
+    candidate_entry_homes: tuple[ParameterHome, ...] | None = None,
 ) -> VerificationResult:
-    """Prove every null/alias/allocation-order case admitted by PDB types."""
+    """Prove every null/alias/placement/order case admitted by PDB types.
+
+    A signature without pointers yields a single fully symbolic case, so this
+    is the one driver for every function. Each case executes both sides,
+    declares bounded tables they index, and re-executes when needed.
+    """
     from alias_model import AliasCaseLimit, iter_alias_scenarios
 
     try:
-        scenarios = iter_alias_scenarios(
+        scenarios = iter(iter_alias_scenarios(
             signature, globals=global_objects, pointer_globals=pointer_globals,
-            maximum_cases=None,
-        )
+            maximum_cases=maximum_cases, placements=placements,
+        ))
     except ValueError as error:
         return VerificationResult(
             VerificationStatus.MODEL_INCOMPLETE,
             reasons=(f"ALIAS_MODEL_INCOMPLETE:{error}",),
         )
-    incomplete: VerificationResult | None = None
-    processed_cases = 0
-    execution_options = execute_options or {}
+    options = dict(execute_options or {})
     deadline = (
         time.monotonic() + total_timeout_seconds
         if total_timeout_seconds is not None else None
     )
-    try:
-        scenario_iterator = iter(scenarios)
-    except (AliasCaseLimit, ValueError) as error:
-        return VerificationResult(
-            VerificationStatus.MODEL_INCOMPLETE,
-            reasons=(f"ALIAS_MODEL_INCOMPLETE:{error}",),
+
+    def run(code, calls, base, allocations, homes, arguments, memory, share):
+        run_options = dict(options)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            configured = run_options.get("timeout_seconds")
+            budget = remaining * share
+            run_options["timeout_seconds"] = (
+                min(float(configured), budget) if configured is not None else budget
+            )
+        return execute(
+            code, arguments, calls, call_results, memory, base=base,
+            signature=signature, frontend_issues=frontend_issues,
+            stack_allocations=allocations, entry_homes=homes, **run_options,
         )
+
+    incomplete: VerificationResult | None = None
+    processed_cases = 0
     while True:
         try:
-            scenario = next(scenario_iterator)
+            scenario = next(scenarios)
         except StopIteration:
             break
         except (AliasCaseLimit, ValueError) as error:
@@ -1048,102 +1775,47 @@ def verify_under_pdb_aliasing(
                 VerificationStatus.MODEL_INCOMPLETE,
                 reasons=(f"ALIAS_MODEL_INCOMPLETE:{error}",),
             )
-        if deadline is not None and time.monotonic() >= deadline:
-            return VerificationResult(
-                VerificationStatus.INCONCLUSIVE,
-                reasons=("ALIAS_CAMPAIGN_TIMEOUT",),
-            )
         memory = (*common_memory, *scenario.initial_memory)
-        scenario_options = dict(execution_options)
-        scenario_observed = (
+        observed = (
             *observed_memory,
             *((address, value.size() // 8) for address, value in scenario.initial_memory),
         )
-        reference_options = dict(scenario_options)
-        if deadline is not None:
-            remaining = max(0.001, deadline - time.monotonic())
-            configured = reference_options.get("timeout_seconds")
-            reference_options["timeout_seconds"] = min(
-                float(configured) if configured is not None else remaining / 2,
-                remaining / 2,
+        executions = None
+        for attempt in range(DISCOVERY_ROUNDS):
+            reference = run(reference_code, reference_calls, reference_base,
+                            reference_stack_allocations, reference_entry_homes,
+                            scenario.arguments, memory, 0.5)
+            candidate = run(candidate_code, candidate_calls, candidate_base,
+                            candidate_stack_allocations, candidate_entry_homes,
+                            scenario.arguments, memory, 1.0)
+            if reference is None or candidate is None:
+                return VerificationResult(
+                    VerificationStatus.INCONCLUSIVE, reasons=("ALIAS_CAMPAIGN_TIMEOUT",),
+                )
+            executions = (reference, candidate)
+            extra_regions = (
+                bounded_external_regions(executions, observed)
+                if attempt + 1 < DISCOVERY_ROUNDS else ()
             )
-        reference = execute(
-            reference_code, scenario.arguments, reference_calls, call_results,
-            memory, base=reference_base, signature=signature,
-            frontend_issues=frontend_issues,
-            **reference_options,
-        )
-        candidate_options = dict(scenario_options)
-        if deadline is not None:
-            remaining = max(0.001, deadline - time.monotonic())
-            configured = candidate_options.get("timeout_seconds")
-            candidate_options["timeout_seconds"] = min(
-                float(configured) if configured is not None else remaining,
-                remaining,
-            )
-        candidate = execute(
-            candidate_code, scenario.arguments, candidate_calls, call_results,
-            memory, base=candidate_base, signature=signature,
-            frontend_issues=frontend_issues,
-            **candidate_options,
-        )
-        extra_regions = bounded_external_regions(
-            (reference, candidate), scenario_observed,
-        )
-        if extra_regions:
-            extra_memory = tuple(
+            if not extra_regions:
+                break
+            # Accesses to undeclared bounded ranges (tables, and the parts of
+            # large objects a run touches) reveal finite regions; declare them
+            # as shared, observed memory and execute again until none remain.
+            # Whatever is still undeclared fails the access check.
+            memory = (*memory, *(
                 (address, claripy.BVS(
-                    f"alias_bounded_{address:x}_{size}", size * 8,
-                    explicit_name=True,
+                    f"alias_bounded_{address:x}_{size}", size * 8, explicit_name=True,
                 ))
                 for address, size in extra_regions
-            )
-            complete_memory = (*memory, *extra_memory)
-            retry_reference_options = dict(scenario_options)
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return VerificationResult(
-                        VerificationStatus.INCONCLUSIVE,
-                        reasons=("ALIAS_CAMPAIGN_TIMEOUT",),
-                    )
-                configured = retry_reference_options.get("timeout_seconds")
-                retry_reference_options["timeout_seconds"] = min(
-                    float(configured) if configured is not None else remaining / 2,
-                    remaining / 2,
-                )
-            reference = execute(
-                reference_code, scenario.arguments, reference_calls, call_results,
-                complete_memory, base=reference_base, signature=signature,
-                frontend_issues=frontend_issues,
-                **retry_reference_options,
-            )
-            retry_candidate_options = dict(scenario_options)
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return VerificationResult(
-                        VerificationStatus.INCONCLUSIVE,
-                        reasons=("ALIAS_CAMPAIGN_TIMEOUT",),
-                    )
-                configured = retry_candidate_options.get("timeout_seconds")
-                retry_candidate_options["timeout_seconds"] = min(
-                    float(configured) if configured is not None else remaining,
-                    remaining,
-                )
-            candidate = execute(
-                candidate_code, scenario.arguments, candidate_calls, call_results,
-                complete_memory, base=candidate_base, signature=signature,
-                frontend_issues=frontend_issues,
-                **retry_candidate_options,
-            )
-            scenario_observed = (*scenario_observed, *extra_regions)
+            ))
+            observed = (*observed, *extra_regions)
         symbolic_inputs = tuple(
             value for value in scenario.arguments if value.symbolic
         ) + tuple(value for _, value in scenario.initial_memory)
         result = verify_equivalence(
-            reference, candidate, symbolic_inputs,
-            observed_memory=scenario_observed,
+            *executions, symbolic_inputs,
+            observed_memory=observed,
             return_pointer=signature.return_type.pointer,
         )
         if result.status == VerificationStatus.NOT_EQUIVALENT:
@@ -1156,8 +1828,13 @@ def verify_under_pdb_aliasing(
                 result.status, result.counterexample,
                 (f"ALIAS_SCENARIO:{scenario.name}", *result.reasons),
             )
+        if result.status == VerificationStatus.INCONCLUSIVE:
+            # The function can no longer be proved. Later cases could only
+            # find a counterexample, and a case that exhausted its limits
+            # predicts the rest will too; stop spending the budget.
+            return incomplete
         processed_cases += 1
-        del reference, candidate, result
+        del executions, result
         if processed_cases % 8 == 0:
             gc.collect()
     return incomplete or VerificationResult(VerificationStatus.EQUIVALENT)

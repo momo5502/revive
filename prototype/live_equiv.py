@@ -31,7 +31,7 @@ def main() -> int:
     player_flags = claripy.BVS("live_player_flags", 32, explicit_name=True)
     weapon_flag = claripy.BVS("live_weapon_flag", 8, explicit_name=True)
 
-    callee = pdb_call_target(
+    callee, _ = pdb_call_target(
         pair, 0x4256E0, "?BG_GetWeaponDef@@YAPAUWeaponDef@@I@Z",
         fresh_result=False,
     )

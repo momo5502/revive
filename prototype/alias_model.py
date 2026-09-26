@@ -1,20 +1,27 @@
 """Finite relational allocation cases derived from PDB pointer types.
 
 Each case uses the same concrete allocation addresses on both executions while
-keeping all bytes symbolic.  Enumerating nullability, set partitions, and
-allocation order covers pointer equality, legal aliasing, and relational
-ordering without asking angr to emulate a symbolic-address heap.
+keeping all bytes symbolic.  Enumerating nullability, set partitions, interior
+placements, and allocation order covers pointer equality, legal aliasing,
+partial overlap, and relational ordering without asking angr to emulate a
+symbolic-address heap.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
-from typing import Iterable
+from itertools import permutations, product
+from typing import Callable, Iterable
 
 import claripy
 
 from pdb_frontend import ABISignature
+
+
+# Fresh allocations live far from the image, the synthetic constant and TLS
+# ranges (0x20000000-0x24000000), and the modeled stack (below 0x7FFF0000).
+ALLOCATION_BASE = 0x40000000
+ALLOCATION_LIMIT = 0x7F000000
 
 
 @dataclass(frozen=True)
@@ -22,6 +29,7 @@ class GlobalObject:
     logical_id: str
     address: int
     size: int
+    type_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ class PointerGlobal:
     logical_id: str
     address: int
     pointee_size: int
+    pointee_type: int | None = None
 
 
 @dataclass(frozen=True)
@@ -44,103 +53,39 @@ class AliasCaseLimit(ValueError):
     pass
 
 
-def symbolic_alias_scenario(
-    signature: ABISignature,
-    *,
-    globals: tuple[GlobalObject, ...] = (),
-    pointer_globals: tuple[PointerGlobal, ...] = (),
-    allocation_base: int = 0x300000,
-    allocation_stride: int = 0x10000,
-    include_null: bool = True,
-) -> AliasScenario:
-    """Represent every finite null/alias/order case in one solver domain.
+# (outer type, outer size, inner type, inner size) -> offsets at which an
+# object of the inner type may lie inside the outer object, or None when the
+# types are unknown and every aligned offset must be considered.
+Placements = Callable[[int | None, int, int | None, int], "tuple[int, ...] | None"]
 
-    Each pointer chooses a null value, any canonical fresh allocation, or any
-    size-compatible typed global.  Sharing a choice expresses aliasing.  Since
-    pointers independently choose any fresh slot, every allocation ordering is
-    represented without eagerly enumerating Bell partitions and permutations.
+
+def aligned_offsets(outer_size: int, inner_size: int) -> tuple[int, ...]:
+    """Every naturally aligned offset of an inner object inside an outer one."""
+    if inner_size > outer_size:
+        return ()
+    alignment = 1
+    while alignment < 4 and alignment * 2 <= inner_size and inner_size % (alignment * 2) == 0:
+        alignment *= 2
+    return tuple(range(0, outer_size - inner_size + 1, alignment))
+
+
+def _interior_offsets(placements: Placements | None, outer: tuple[int, int | None],
+                      inner: tuple[int, int | None]) -> tuple[int, ...]:
+    """Offsets for ``inner`` inside ``outer``.
+
+    Equal-sized objects may always coincide: MSVC does not exploit type-based
+    aliasing, so full overlap is admitted regardless of declared types.
+    Interior placements follow the PDB layout when both types are known.
     """
-    pointer_positions = [
-        index for index, value in enumerate(signature.parameters) if value.pointer
-    ]
-    for index in pointer_positions:
-        if signature.parameters[index].pointee_size is None:
-            raise ValueError(
-                f"pointer argument {index} ({signature.parameters[index].name}) "
-                "has unknown pointee size"
-            )
-    entity_sizes = [
-        signature.parameters[position].pointee_size or 0
-        for position in pointer_positions
-    ] + [item.pointee_size for item in pointer_globals]
-    entity_count = len(entity_sizes)
-    if not entity_count:
-        arguments = tuple(
-            claripy.BVS(f"abi_arg_{index}", parameter.size * 8, explicit_name=True)
-            for index, parameter in enumerate(signature.parameters)
-        )
-        return AliasScenario("symbolic", arguments, (), (), ())
-
-    maximum_size = max(entity_sizes)
-    if maximum_size <= 0:
-        raise ValueError("pointer model requires a positive pointee size")
-    allocation_stride = max(
-        allocation_stride, (maximum_size + 0xFFF) & ~0xFFF,
+    outer_size, outer_type = outer
+    inner_size, inner_type = inner
+    offsets: set[int] = {0} if outer_size == inner_size else set()
+    typed = (
+        placements(outer_type, outer_size, inner_type, inner_size)
+        if placements is not None else None
     )
-    fresh_addresses = tuple(
-        allocation_base + index * allocation_stride for index in range(entity_count)
-    )
-    pointers = tuple(
-        claripy.BVS(f"alias_pointer_{index}", 32, explicit_name=True)
-        for index in range(entity_count)
-    )
-    constraints: list[claripy.ast.Bool] = []
-    for pointer, size in zip(pointers, entity_sizes, strict=True):
-        choices = [*fresh_addresses]
-        choices.extend(item.address for item in globals if item.size >= size)
-        if include_null:
-            choices.append(0)
-        constraints.append(claripy.Or(*(pointer == value for value in choices)))
-
-    restricted = {
-        ordinal for ordinal, position in enumerate(pointer_positions)
-        if signature.parameters[position].restrict
-    }
-    for restricted_ordinal in restricted:
-        for other in range(entity_count):
-            if other == restricted_ordinal:
-                continue
-            constraints.append(claripy.Or(
-                pointers[restricted_ordinal] == 0,
-                pointers[other] == 0,
-                pointers[restricted_ordinal] != pointers[other],
-            ))
-
-    arguments: list[claripy.ast.BV] = []
-    pointer_ordinal = 0
-    for index, parameter in enumerate(signature.parameters):
-        if parameter.pointer:
-            arguments.append(pointers[pointer_ordinal])
-            pointer_ordinal += 1
-        else:
-            arguments.append(claripy.BVS(
-                f"abi_arg_{index}", parameter.size * 8, explicit_name=True,
-            ))
-    memory = [
-        (address, claripy.BVS(
-            f"alias_object_{index}_{maximum_size}", maximum_size * 8,
-            explicit_name=True,
-        ))
-        for index, address in enumerate(fresh_addresses)
-    ]
-    memory.extend(
-        (item.address, pointers[index])
-        for index, item in enumerate(pointer_globals, start=len(pointer_positions))
-    )
-    return AliasScenario(
-        "symbolic", tuple(arguments), tuple(memory),
-        tuple(None for _ in pointer_positions), tuple(constraints),
-    )
+    offsets.update(aligned_offsets(outer_size, inner_size) if typed is None else typed)
+    return tuple(sorted(offset for offset in offsets if offset + inner_size <= outer_size))
 
 
 def _partitions(count: int, restricted: frozenset[int]) -> Iterable[tuple[int, ...]]:
@@ -163,15 +108,38 @@ def _partitions(count: int, restricted: frozenset[int]) -> Iterable[tuple[int, .
     yield from visit(0, 0)
 
 
+def _group_layouts(members: list[int], entities: list[tuple[int, int | None]],
+                   placements: Placements | None):
+    """Yield (host entity, {member: offset}) for one alias group.
+
+    Every member lies inside the group's largest pointee (the host). Mutual
+    straddling overlaps between objects of which neither contains the other
+    are not enumerated.
+    """
+    host = max(members, key=lambda member: entities[member][0])
+    options = []
+    for member in members:
+        offsets = (0,) if member == host else _interior_offsets(
+            placements, entities[host], entities[member],
+        )
+        if not offsets:
+            return
+        options.append(offsets)
+    for chosen in product(*options):
+        yield host, dict(zip(members, chosen, strict=True))
+
+
+
 def iter_alias_scenarios(
     signature: ABISignature,
     *,
     globals: tuple[GlobalObject, ...] = (),
     pointer_globals: tuple[PointerGlobal, ...] = (),
-    allocation_base: int = 0x300000,
+    allocation_base: int = ALLOCATION_BASE,
     allocation_stride: int = 0x10000,
     include_null: bool = True,
     maximum_cases: int | None = None,
+    placements: Placements | None = None,
 ) -> Iterable[AliasScenario]:
     pointer_positions = [index for index, value in enumerate(signature.parameters) if value.pointer]
     for index in pointer_positions:
@@ -179,18 +147,24 @@ def iter_alias_scenarios(
             raise ValueError(
                 f"pointer argument {index} ({signature.parameters[index].name}) has unknown pointee size"
             )
-    entity_sizes = [
-        signature.parameters[position].pointee_size or 0
+    entities: list[tuple[int, int | None]] = [
+        (signature.parameters[position].pointee_size or 0,
+         signature.parameters[position].pointee_type)
         for position in pointer_positions
-    ] + [item.pointee_size for item in pointer_globals]
+    ] + [(item.pointee_size, item.pointee_type) for item in pointer_globals]
     restricted = frozenset(
         ordinal for ordinal, position in enumerate(pointer_positions)
         if signature.parameters[position].restrict
     )
-    entity_count = len(entity_sizes)
+    entity_count = len(entities)
     allocation_stride = max(
         allocation_stride,
-        ((max(entity_sizes, default=1) + 0xFFF) & ~0xFFF),
+        ((max((size for size, _ in entities), default=1) + 0xFFF) & ~0xFFF),
+    )
+    if allocation_base + entity_count * allocation_stride > ALLOCATION_LIMIT:
+        raise ValueError("fresh pointer allocations exceed the reserved address range")
+    fresh_addresses = tuple(
+        allocation_base + index * allocation_stride for index in range(entity_count)
     )
     generated = 0
     null_masks = product((False, True), repeat=entity_count) if include_null else [(False,) * entity_count]
@@ -201,82 +175,106 @@ def iter_alias_scenarios(
         )
         for partition in _partitions(len(live_ordinals), live_restricted):
             group_count = max(partition, default=-1) + 1
-            fresh_addresses = tuple(
-                allocation_base + index * allocation_stride for index in range(group_count)
-            )
-            group_sizes = tuple(
-                max(
-                    entity_sizes[live_ordinals[i]]
-                    for i, value in enumerate(partition) if value == group
-                )
+            groups = [
+                [live_ordinals[i] for i, value in enumerate(partition) if value == group]
                 for group in range(group_count)
-            )
-            global_by_address = {item.address: item for item in globals}
-            choices = tuple(
-                (*fresh_addresses, *(item.address for item in globals
-                                     if item.size == group_sizes[group]))
-                for group in range(group_count)
-            )
-            address_sets = product(*choices) if choices else [()]
-            for addresses in address_sets:
-                # Distinct partition groups are distinct allocations.
-                if len(set(addresses)) != len(addresses):
-                    continue
-                pointer_values: list[int | None] = [None] * entity_count
-                live_index = 0
-                for ordinal, is_null in enumerate(null_mask):
-                    if is_null:
-                        pointer_values[ordinal] = 0
-                    else:
-                        pointer_values[ordinal] = addresses[partition[live_index]]
-                        live_index += 1
-                arguments: list[claripy.ast.BV] = []
-                for index, parameter in enumerate(signature.parameters):
-                    if parameter.pointer:
-                        ordinal = pointer_positions.index(index)
-                        arguments.append(claripy.BVV(pointer_values[ordinal], 32))
-                    else:
-                        arguments.append(claripy.BVS(
-                            f"abi_arg_{index}", parameter.size * 8, explicit_name=True,
-                        ))
-                memory: list[tuple[int, claripy.ast.BV]] = []
-                for group, address in enumerate(addresses):
-                    size = group_sizes[group]
-                    global_choice = global_by_address.get(address)
-                    if global_choice:
-                        size = max(size, global_choice.size)
-                    memory.append((address, claripy.BVS(
-                        f"alias_object_{group}_{size}", size * 8, explicit_name=True,
-                    )))
-                for ordinal, pointer_global in enumerate(
-                    pointer_globals, start=len(pointer_positions),
-                ):
-                    memory.append((
-                        pointer_global.address,
-                        claripy.BVV(pointer_values[ordinal], 32),
-                    ))
-                description = "null=" + "".join("1" if item else "0" for item in null_mask)
-                description += ";partition=" + ",".join(map(str, partition))
-                selected_globals = [global_by_address[address].logical_id
-                                    for address in addresses if address in global_by_address]
-                if selected_globals:
-                    description += ";globals=" + ",".join(selected_globals)
-                if pointer_globals:
-                    description += ";pointer-globals=" + ",".join(
-                        f"{item.logical_id}:{pointer_values[index]}"
-                        for index, item in enumerate(
-                            pointer_globals, start=len(pointer_positions),
+            ]
+            layouts = [list(_group_layouts(members, entities, placements)) for members in groups]
+            for layout in product(*layouts):
+                hosts = [entities[host] for host, _ in layout]
+                # Each group is either a distinct fresh allocation, in every
+                # relative order, or lies inside a referenced global.
+                global_choices = [
+                    tuple(
+                        (item.address + offset, item)
+                        for item in globals
+                        for offset in _interior_offsets(
+                            placements, (item.size, item.type_index), host,
                         )
                     )
-                yield AliasScenario(
-                    description, tuple(arguments), tuple(memory),
-                    tuple(pointer_values[:len(pointer_positions)]),
-                )
-                generated += 1
-                if maximum_cases is not None and generated >= maximum_cases:
-                    raise AliasCaseLimit(
-                        f"PDB alias model requires more than {maximum_cases} cases"
-                    )
+                    for host in hosts
+                ]
+                for global_mask in product((False, True), repeat=group_count):
+                    if any(mask and not global_choices[group]
+                           for group, mask in enumerate(global_mask)):
+                        continue
+                    fresh_groups = [group for group in range(group_count) if not global_mask[group]]
+                    for order in permutations(range(len(fresh_groups))):
+                        options: list[tuple] = [()] * group_count
+                        for position, group in enumerate(fresh_groups):
+                            options[group] = ((fresh_addresses[order[position]], None),)
+                        for group in range(group_count):
+                            if global_mask[group]:
+                                options[group] = global_choices[group]
+                        for chosen in product(*options):
+                            scenario = _scenario(
+                                signature, pointer_positions, pointer_globals,
+                                null_mask, partition, layout, hosts, chosen,
+                            )
+                            if scenario is None:
+                                continue
+                            yield scenario
+                            generated += 1
+                            if maximum_cases is not None and generated >= maximum_cases:
+                                raise AliasCaseLimit(
+                                    f"PDB alias model requires more than {maximum_cases} cases"
+                                )
+
+
+def _scenario(signature, pointer_positions, pointer_globals, null_mask, partition,
+              layout, hosts, chosen) -> AliasScenario | None:
+    bases = [address for address, _ in chosen]
+    extents = [(base, base + hosts[group][0]) for group, base in enumerate(bases)]
+    # Distinct groups are distinct, non-overlapping objects.
+    if any(left[0] < right[1] and right[0] < left[1]
+           for index, left in enumerate(extents) for right in extents[index + 1:]):
+        return None
+    pointer_values: list[int] = [0] * len(null_mask)
+    for group, (_, offsets) in enumerate(layout):
+        for member, offset in offsets.items():
+            pointer_values[member] = bases[group] + offset
+    arguments: list[claripy.ast.BV] = []
+    for index, parameter in enumerate(signature.parameters):
+        if parameter.pointer:
+            arguments.append(claripy.BVV(pointer_values[pointer_positions.index(index)], 32))
+        else:
+            arguments.append(claripy.BVS(
+                f"abi_arg_{index}", parameter.size * 8, explicit_name=True,
+            ))
+    # Fresh objects get symbolic contents named by slot; globals keep theirs.
+    memory: list[tuple[int, claripy.ast.BV]] = [
+        (bases[group], claripy.BVS(
+            f"alias_object_{bases[group]:x}_{hosts[group][0]}",
+            hosts[group][0] * 8, explicit_name=True,
+        ))
+        for group in range(len(chosen)) if chosen[group][1] is None
+    ]
+    for ordinal, pointer_global in enumerate(pointer_globals, start=len(pointer_positions)):
+        memory.append((pointer_global.address, claripy.BVV(pointer_values[ordinal], 32)))
+    description = "null=" + "".join("1" if item else "0" for item in null_mask)
+    description += ";partition=" + ",".join(map(str, partition))
+    interior = [
+        f"{member}+{offset}" for _, offsets in layout
+        for member, offset in sorted(offsets.items()) if offset
+    ]
+    if interior:
+        description += ";interior=" + ",".join(interior)
+    description += ";bases=" + ",".join(f"{base:x}" for base in bases)
+    selected_globals = [
+        f"{item.logical_id}+{address - item.address}"
+        for address, item in chosen if item is not None
+    ]
+    if selected_globals:
+        description += ";globals=" + ",".join(selected_globals)
+    if pointer_globals:
+        description += ";pointer-globals=" + ",".join(
+            f"{item.logical_id}:{pointer_values[index]}"
+            for index, item in enumerate(pointer_globals, start=len(pointer_positions))
+        )
+    return AliasScenario(
+        description, tuple(arguments), tuple(memory),
+        tuple(pointer_values[:len(pointer_positions)]),
+    )
 
 
 def alias_scenarios(
@@ -284,14 +282,16 @@ def alias_scenarios(
     *,
     globals: tuple[GlobalObject, ...] = (),
     pointer_globals: tuple[PointerGlobal, ...] = (),
-    allocation_base: int = 0x300000,
+    allocation_base: int = ALLOCATION_BASE,
     allocation_stride: int = 0x10000,
     include_null: bool = True,
     maximum_cases: int = 4096,
+    placements: Placements | None = None,
 ) -> tuple[AliasScenario, ...]:
     """Materialized compatibility wrapper used by small unit tests."""
     return tuple(iter_alias_scenarios(
         signature, globals=globals, pointer_globals=pointer_globals,
         allocation_base=allocation_base, allocation_stride=allocation_stride,
         include_null=include_null, maximum_cases=maximum_cases,
+        placements=placements,
     ))

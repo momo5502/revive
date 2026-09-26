@@ -18,6 +18,7 @@ TOOL_PACKAGES = ("angr", "claripy", "pyvex", "z3-solver", "capstone")
 IMPLEMENTATION_FILES = (
     "alias_model.py",
     "angr_equiv.py",
+    "campaign.py",
     "live_extract.py",
     "pdb_frontend.py",
     "proof_record.py",

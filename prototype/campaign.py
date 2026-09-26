@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 from dataclasses import dataclass
+import functools
 import hashlib
 import json
 import logging
 import multiprocessing
 import os
 from pathlib import Path
+import random
 import time
 from typing import Any
 
@@ -20,18 +23,14 @@ logging.getLogger("cle").setLevel(logging.CRITICAL)
 import claripy
 
 from alias_model import GlobalObject, PointerGlobal
-from angr_equiv import (
-    bounded_external_regions,
-    VerificationStatus,
-    execute,
-    verify_equivalence,
-    verify_under_pdb_aliasing,
-)
+from angr_equiv import VerificationStatus, verify_under_pdb_aliasing
 from live_extract import (
     external_call_contracts,
     extract,
     global_object_contracts,
     pointer_global_contracts,
+    stack_allocation_contracts,
+    type_placements,
 )
 from proof_record import proof_fingerprint
 
@@ -57,6 +56,8 @@ class WorkItem:
     timeout: float
     maximum_steps: int
     maximum_alias_cases: int
+    worker_timeout: float | None = None
+    function_timeout: float | None = None
     previous_status: str | None = None
     previous_fingerprint: str | None = None
 
@@ -173,14 +174,49 @@ def _argument(name: str, size: int) -> claripy.ast.BV:
     return claripy.BVS(name, size * 8, explicit_name=True)
 
 
+@functools.lru_cache(maxsize=None)
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _frontend_identity(paths: Paths, matcher) -> dict[str, str]:
+    """Inputs outside the function bytes that shape extraction and contracts."""
+    repository = Path(paths.repository)
+    files = {
+        "matcher": repository / "tools" / "byte_match" / "iw4match.py",
+        "target_data_rvas": repository / matcher.DEFAULT_TARGET_DATA_RVAS,
+        "target_function_rvas": repository / matcher.DEFAULT_TARGET_FUNCTION_RVAS,
+        "target_exe": Path(paths.exe),
+        "target_pdb": Path(paths.pdb),
+    }
+    return {
+        name: _file_sha256(str(path)) if path.is_file() else "missing"
+        for name, path in files.items()
+    }
+
+
 def _classify(item: WorkItem) -> WorkResult:
     started = time.monotonic()
+
+    def finish(status: str, fingerprint: str | None, reasons: tuple[str, ...],
+               counterexample: tuple[int, ...] | None = None,
+               cached: bool = False) -> WorkResult:
+        return WorkResult(
+            item.selector, status, fingerprint, reasons, counterexample,
+            time.monotonic() - started, cached,
+        )
+
     try:
         pair = extract(
             Path(item.paths.repository), Path(item.paths.build),
             Path(item.paths.pdb), Path(item.paths.exe), item.selector,
         )
         signature = pair["signature"]
+        frontend = _frontend_identity(item.paths, pair["matcher"])
         if pair["reference"] == pair["candidate"]:
             fingerprint = proof_fingerprint(
                 symbol=item.selector,
@@ -188,185 +224,151 @@ def _classify(item: WorkItem) -> WorkResult:
                 candidate_relocations=pair["relocation_resolutions"],
                 signature=signature,
                 options={"classification": "byte-exact"},
-                assumptions={"frontend_issues": pair["frontend_issues"]},
+                assumptions={"frontend_issues": pair["frontend_issues"], "frontend": frontend},
             )
-            if (item.previous_status == "EXACT_NOW" and
-                    item.previous_fingerprint == fingerprint):
-                return WorkResult(
-                    item.selector, "EXACT_NOW", fingerprint, (), None,
-                    time.monotonic() - started, True,
-                )
-            return WorkResult(
-                item.selector, "EXACT_NOW", fingerprint, (), None,
-                time.monotonic() - started,
-            )
-        calls = external_call_contracts(pair)
+            cached = (item.previous_status == "EXACT_NOW" and
+                      item.previous_fingerprint == fingerprint)
+            return finish("EXACT_NOW", fingerprint, (), cached=cached)
+        reference_calls, candidate_calls = external_call_contracts(pair)
         global_descriptors = global_object_contracts(pair)
         pointer_descriptors = pointer_global_contracts(pair)
-        global_objects = tuple(
-            GlobalObject(item.logical_id, item.address, item.size)
-            for item in global_descriptors
-        )
-        pointer_globals = tuple(
-            PointerGlobal(item.logical_id, item.address, item.pointee_size)
-            for item in pointer_descriptors
-        )
-        common_memory = tuple(
-            (item.address, claripy.BVV(
-                int.from_bytes(item.content, "little"), item.size * 8,
-            ) if item.content is not None else claripy.BVS(
-                f"campaign_global_{index}_{item.address:x}", item.size * 8,
-                explicit_name=True,
-            ))
-            for index, item in enumerate(global_descriptors)
-        )
-        observed_memory = tuple(
-            (item.address, item.size) for item in global_descriptors
-        )
-        call_results = tuple(
-            claripy.BVS(
-                f"campaign_call_{index}",
-                (64 if call.return_register == "x87_st0" else
-                 call.signature.return_type.size * 8
-                 if call.signature and call.signature.return_type.size else 32),
-                explicit_name=True,
-            )
-            for index, call in enumerate(calls)
-        )
-        fingerprint = proof_fingerprint(
-            symbol=item.selector,
-            reference=pair["reference"], candidate=pair["candidate"],
-            candidate_relocations=pair["relocation_resolutions"],
-            signature=signature, options={
-                "timeout": item.timeout,
-                "maximum_steps": item.maximum_steps,
-                "maximum_alias_cases": item.maximum_alias_cases,
-                "call_contracts": tuple(
-                    (call.address, call.decorated_symbol, call.argument_count,
-                     call.callsite_argument_counts, repr(call.signature))
-                    for call in calls
-                ),
-                "global_objects": tuple(
-                    (item.logical_id, item.address, item.size,
-                     item.content.hex() if item.content is not None else None)
-                    for item in global_descriptors
-                ),
-                "pointer_globals": tuple(
-                    (item.logical_id, item.address, item.pointee_size)
-                    for item in pointer_descriptors
-                ),
-            }, assumptions={"frontend_issues": pair["frontend_issues"]},
-        )
-        if (item.previous_status in TERMINAL and
-                item.previous_fingerprint == fingerprint):
-            return WorkResult(
-                item.selector, item.previous_status, fingerprint, (), None,
-                time.monotonic() - started, True,
-            )
-        if signature is None:
-            return WorkResult(
-                item.selector, VerificationStatus.UNSUPPORTED.value, fingerprint,
-                pair["frontend_issues"] or ("UNSUPPORTED_PDB_ABI",), None,
-                time.monotonic() - started,
-            )
-        if (any(parameter.pointer for parameter in signature.parameters) or
-                pointer_globals):
-            result = verify_under_pdb_aliasing(
-                pair["reference"], pair["candidate"], signature,
-                reference_calls=calls, candidate_calls=calls,
-                call_results=call_results,
-                common_memory=common_memory,
-                observed_memory=observed_memory,
-                global_objects=global_objects,
-                pointer_globals=pointer_globals,
-                reference_base=pair["address"], candidate_base=pair["address"],
-                frontend_issues=pair["frontend_issues"],
-                maximum_cases=item.maximum_alias_cases,
-                execute_options={
-                    "timeout_seconds": item.timeout,
-                    "maximum_steps": item.maximum_steps,
-                },
-                # Alias cases are streamed and each execution has its own
-                # timeout. A single wall-clock deadline made later cases
-                # inconclusive merely because earlier valid cases existed.
-                total_timeout_seconds=None,
-            )
-        else:
-            arguments = tuple(
-                _argument(f"campaign_arg_{index}", parameter.size)
-                for index, parameter in enumerate(signature.parameters)
-            )
-            reference = execute(
-                pair["reference"], arguments, calls, call_results,
-                common_memory,
-                base=pair["address"],
-                signature=signature, frontend_issues=pair["frontend_issues"],
-                timeout_seconds=item.timeout, maximum_steps=item.maximum_steps,
-            )
-            candidate = execute(
-                pair["candidate"], arguments, calls, call_results,
-                common_memory,
-                base=pair["address"],
-                signature=signature, frontend_issues=pair["frontend_issues"],
-                timeout_seconds=item.timeout, maximum_steps=item.maximum_steps,
-            )
-            extra_regions = bounded_external_regions(
-                (reference, candidate), observed_memory,
-            )
-            if extra_regions:
-                extra_memory = tuple(
-                    (address, claripy.BVS(
-                        f"campaign_bounded_{address:x}_{size}", size * 8,
-                        explicit_name=True,
-                    ))
-                    for address, size in extra_regions
-                )
-                complete_memory = (*common_memory, *extra_memory)
-                reference = execute(
-                    pair["reference"], arguments, calls, call_results,
-                    complete_memory, base=pair["address"],
-                    signature=signature, frontend_issues=pair["frontend_issues"],
-                    timeout_seconds=item.timeout, maximum_steps=item.maximum_steps,
-                )
-                candidate = execute(
-                    pair["candidate"], arguments, calls, call_results,
-                    complete_memory, base=pair["address"],
-                    signature=signature, frontend_issues=pair["frontend_issues"],
-                    timeout_seconds=item.timeout, maximum_steps=item.maximum_steps,
-                )
-                observed_memory = (*observed_memory, *extra_regions)
-            result = verify_equivalence(
-                reference, candidate, arguments,
-                observed_memory=observed_memory,
-            )
-        return WorkResult(
-            item.selector, result.status.value, fingerprint, result.reasons,
-            result.counterexample, time.monotonic() - started,
-        )
+        reference_allocations, candidate_allocations = stack_allocation_contracts(pair)
+        placements = type_placements(pair)
     except FileNotFoundError as error:
-        return WorkResult(
-            item.selector, VerificationStatus.UNSUPPORTED.value, None,
-            (f"MISSING_CANDIDATE_OBJECT:{error}",), None,
-            time.monotonic() - started,
+        return finish(VerificationStatus.UNSUPPORTED.value, None,
+                      (f"MISSING_CANDIDATE_OBJECT:{error}",))
+    except Exception as error:
+        return finish("EXTRACTION_FAILED", None, (f"{type(error).__name__}:{error}",))
+
+    global_objects = tuple(
+        GlobalObject(item.logical_id, item.address, item.size, item.type_index)
+        for item in global_descriptors
+    )
+    pointer_globals = tuple(
+        PointerGlobal(item.logical_id, item.address, item.pointee_size)
+        for item in pointer_descriptors
+    )
+    # Mutable globals are not declared: a named global resolves to the same
+    # address on both sides, so the engine models exactly the bytes an
+    # execution touches, by address. Declaring whole objects (e.g. the 1 MB
+    # cgArray) and snapshotting them at every call exhausted memory. Only
+    # constants with known contents are declared. Globals stay alias targets.
+    declared = tuple(
+        descriptor for descriptor in global_descriptors if descriptor.content is not None
+    )
+    common_memory = tuple(
+        (descriptor.address, claripy.BVV(
+            int.from_bytes(descriptor.content, "little"), descriptor.size * 8,
+        ) if descriptor.content is not None else claripy.BVS(
+            f"campaign_global_{index}_{descriptor.address:x}", descriptor.size * 8,
+            explicit_name=True,
+        ))
+        for index, descriptor in enumerate(declared)
+    )
+    observed_memory = tuple(
+        (descriptor.address, descriptor.size) for descriptor in declared
+    )
+    call_results = tuple(
+        claripy.BVS(
+            f"campaign_call_{index}",
+            (64 if call.return_register == "x87_st0" else
+             call.signature.return_type.size * 8
+             if call.signature and call.signature.return_type.size else 32),
+            explicit_name=True,
+        )
+        for index, call in enumerate(reference_calls)
+    )
+    fingerprint = proof_fingerprint(
+        symbol=item.selector,
+        reference=pair["reference"], candidate=pair["candidate"],
+        candidate_relocations=pair["relocation_resolutions"],
+        signature=signature, options={
+            "timeout": item.timeout,
+            "maximum_steps": item.maximum_steps,
+            "maximum_alias_cases": item.maximum_alias_cases,
+            "function_timeout": item.function_timeout,
+            "call_contracts": tuple(
+                (call.address, call.decorated_symbol, call.argument_count,
+                 call.callsite_argument_counts, call.x87_pops, repr(call.signature),
+                 call.frontend_issues, call.entry_homes)
+                for calls in (reference_calls, candidate_calls) for call in calls
+            ),
+            "entry_homes": (pair["reference_homes"], pair["candidate_homes"]),
+            "global_objects": tuple(
+                (descriptor.logical_id, descriptor.address, descriptor.size,
+                 descriptor.type_index,
+                 descriptor.content.hex() if descriptor.content is not None else None)
+                for descriptor in global_descriptors
+            ),
+            "pointer_globals": tuple(
+                (descriptor.logical_id, descriptor.address, descriptor.pointee_size)
+                for descriptor in pointer_descriptors
+            ),
+            "stack_allocations": (reference_allocations, candidate_allocations),
+        }, assumptions={"frontend_issues": pair["frontend_issues"], "frontend": frontend},
+    )
+    if (item.previous_status in TERMINAL and
+            item.previous_fingerprint == fingerprint):
+        return finish(item.previous_status, fingerprint, (), cached=True)
+    if signature is None:
+        return finish(VerificationStatus.UNSUPPORTED.value, fingerprint,
+                      pair["frontend_issues"] or ("UNSUPPORTED_PDB_ABI",))
+    mismatch = tuple(
+        issue for issue in pair["frontend_issues"]
+        if issue.startswith("CANDIDATE_SIGNATURE_MISMATCH")
+    )
+    if mismatch:
+        # The candidate declares a different interface; callers cannot
+        # observe the same behavior through it.
+        return finish(VerificationStatus.NOT_EQUIVALENT.value, fingerprint, mismatch)
+
+    try:
+        result = verify_under_pdb_aliasing(
+            pair["reference"], pair["candidate"], signature,
+            reference_calls=reference_calls, candidate_calls=candidate_calls,
+            call_results=call_results,
+            common_memory=common_memory,
+            observed_memory=observed_memory,
+            global_objects=global_objects,
+            pointer_globals=pointer_globals,
+            reference_base=pair["address"], candidate_base=pair["address"],
+            frontend_issues=pair["frontend_issues"],
+            maximum_cases=item.maximum_alias_cases,
+            execute_options={
+                "timeout_seconds": item.timeout,
+                "maximum_steps": item.maximum_steps,
+            },
+            # One budget for every alias case of the function; running out
+            # is INCONCLUSIVE (ALIAS_CAMPAIGN_TIMEOUT).
+            total_timeout_seconds=item.function_timeout,
+            reference_stack_allocations=reference_allocations,
+            candidate_stack_allocations=candidate_allocations,
+            placements=placements,
+            reference_entry_homes=pair["reference_homes"],
+            candidate_entry_homes=pair["candidate_homes"],
         )
     except MemoryError as error:
-        return WorkResult(
-            item.selector, VerificationStatus.INCONCLUSIVE.value, None,
-            (f"RESOURCE_EXHAUSTED:{type(error).__name__}:{error}",), None,
-            time.monotonic() - started,
-        )
+        return finish(VerificationStatus.INCONCLUSIVE.value, fingerprint,
+                      (f"RESOURCE_EXHAUSTED:{type(error).__name__}:{error}",))
+    except claripy.errors.ClaripySolverInterruptError as error:
+        return finish(VerificationStatus.INCONCLUSIVE.value, fingerprint,
+                      (f"SOLVER_LIMIT:{error}",))
     except Exception as error:
-        if "out of memory" in str(error).lower():
-            return WorkResult(
-                item.selector, VerificationStatus.INCONCLUSIVE.value, None,
-                (f"RESOURCE_EXHAUSTED:{type(error).__name__}:{error}",), None,
-                time.monotonic() - started,
-            )
-        return WorkResult(
-            item.selector, "EXTRACTION_FAILED", None,
-            (f"{type(error).__name__}:{error}",), None,
-            time.monotonic() - started,
-        )
+        # Verifier failures are not extraction failures and never successes.
+        return finish(VerificationStatus.INCONCLUSIVE.value, fingerprint,
+                      (f"VERIFIER_ERROR:{type(error).__name__}:{error}",))
+
+    borrowed = sorted({
+        relocation.get("target") or "?"
+        for relocation in pair["relocation_resolutions"]
+        if relocation.get("identity_rule") == "reference_address_hint"
+    })
+    if result.status == VerificationStatus.EQUIVALENT and borrowed:
+        # The candidate's data identity was copied from the reference, so an
+        # equivalence proof could not have detected a wrong reference.
+        return finish(VerificationStatus.MODEL_INCOMPLETE.value, fingerprint,
+                      tuple(f"BORROWED_DATA_IDENTITY:{symbol}" for symbol in borrowed))
+    return finish(result.status.value, fingerprint, result.reasons, result.counterexample)
 
 
 def _isolated_entry(item: WorkItem, connection: Any) -> None:
@@ -377,15 +379,83 @@ def _isolated_entry(item: WorkItem, connection: Any) -> None:
         connection.close()
 
 
-def _isolated_results(items: list[WorkItem], jobs: int):
-    """Yield results while allowing a native crash to affect only one item."""
+class _MemoryStatus(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+        ("total_physical", ctypes.c_ulonglong), ("available_physical", ctypes.c_ulonglong),
+        ("total_page_file", ctypes.c_ulonglong), ("available_page_file", ctypes.c_ulonglong),
+        ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
+        ("available_extended_virtual", ctypes.c_ulonglong),
+    ]
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_ulong), ("page_fault_count", ctypes.c_ulong),
+        ("peak_working_set", ctypes.c_size_t), ("working_set", ctypes.c_size_t),
+        ("quota_peak_paged_pool", ctypes.c_size_t), ("quota_paged_pool", ctypes.c_size_t),
+        ("quota_peak_nonpaged_pool", ctypes.c_size_t), ("quota_nonpaged_pool", ctypes.c_size_t),
+        ("pagefile_usage", ctypes.c_size_t), ("peak_pagefile_usage", ctypes.c_size_t),
+    ]
+
+
+def _available_memory() -> int | None:
+    """Free physical memory in bytes (Windows), or None when unknown."""
+    if os.name != "nt":
+        return None
+    status = _MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return status.available_physical
+
+
+def _process_memory(pid: int) -> int | None:
+    """Committed private memory of a process in bytes (Windows)."""
+    if os.name != "nt":
+        return None
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000 | 0x0010, False, pid)
+    if not handle:
+        return None
+    try:
+        counters = _ProcessMemoryCounters()
+        counters.size = ctypes.sizeof(counters)
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(
+                handle, ctypes.byref(counters), counters.size):
+            return None
+        return counters.pagefile_usage
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _isolated_results(items: list[WorkItem], jobs: int, memory_limit: int | None = None):
+    """Yield results while allowing a native crash to affect only one item.
+
+    A worker that exceeds ``memory_limit`` bytes is killed and reported as
+    INCONCLUSIVE. New workers start only while at least that much physical
+    memory is free, so every core is used when memory allows it.
+    """
     context = multiprocessing.get_context("spawn")
     remaining = iter(items)
     active: dict[Any, tuple[WorkItem, Any, float]] = {}
     exhausted = False
 
+    def stop(process, item, connection, started, reason):
+        process.terminate()
+        process.join()
+        connection.close()
+        del active[process]
+        return WorkResult(
+            item.selector, VerificationStatus.INCONCLUSIVE.value, None, (reason,), None,
+            time.monotonic() - started,
+        )
+
     while active or not exhausted:
         while not exhausted and len(active) < jobs:
+            available = _available_memory()
+            if (active and memory_limit is not None and available is not None and
+                    available < memory_limit):
+                break
             try:
                 item = next(remaining)
             except StopIteration:
@@ -406,6 +476,16 @@ def _isolated_results(items: list[WorkItem], jobs: int):
                 except EOFError:
                     pass
             elif process.is_alive():
+                used = _process_memory(process.pid) if memory_limit is not None else None
+                if used is not None and used > memory_limit:
+                    made_progress = True
+                    yield stop(process, item, connection, started,
+                               f"MEMORY_LIMIT:{used >> 20}MB")
+                elif (item.worker_timeout is not None and
+                        time.monotonic() - started > item.worker_timeout):
+                    made_progress = True
+                    yield stop(process, item, connection, started,
+                               f"WORKER_TIMEOUT:{item.worker_timeout:g}s")
                 continue
 
             process.join()
@@ -427,7 +507,7 @@ def _isolated_results(items: list[WorkItem], jobs: int):
             yield result
 
         if active and not made_progress:
-            time.sleep(0.05)
+            time.sleep(0.2)
 
 
 def _summary(results: dict[str, WorkResult]) -> dict[str, int]:
@@ -456,6 +536,8 @@ def run_campaign(args: argparse.Namespace) -> int:
     results = _read_results(args.results)
     if args.order == "hash":
         selectors.sort(key=lambda value: hashlib.sha256(value.encode("utf-8")).digest())
+    elif args.order == "random":
+        random.Random(args.seed).shuffle(selectors)
     if args.start:
         selectors = selectors[args.start:]
     if args.limit is not None:
@@ -465,12 +547,12 @@ def run_campaign(args: argparse.Namespace) -> int:
     )))
     items = [WorkItem(
         selector, paths, args.timeout, args.maximum_steps,
-        args.maximum_alias_cases,
+        args.maximum_alias_cases, args.worker_timeout, args.function_timeout,
         results[selector].status if selector in results else None,
         results[selector].fingerprint if selector in results else None,
     ) for selector in selectors]
     completed = 0
-    for result in _isolated_results(items, args.jobs):
+    for result in _isolated_results(items, args.jobs, int(args.memory_limit * (1 << 30))):
         if not result.cached:
             results[result.selector] = result
             _write_results(args.results, results)
@@ -496,13 +578,28 @@ def main() -> int:
     run.add_argument("--pdb", type=Path, required=True)
     run.add_argument("--exe", type=Path, required=True)
     run.add_argument("--results", type=Path)
-    run.add_argument("--jobs", type=int, default=max(1, min(4, os.cpu_count() or 1)))
+    run.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    run.add_argument(
+        "--memory-limit", type=float, default=8.0,
+        help="GiB per worker; larger workers are killed (INCONCLUSIVE) and new "
+             "workers wait until this much memory is free",
+    )
     run.add_argument("--limit", type=int)
     run.add_argument("--start", type=int, default=0)
-    run.add_argument("--order", choices=("lexical", "hash"), default="hash")
-    run.add_argument("--timeout", type=float, default=300.0)
+    run.add_argument("--order", choices=("lexical", "hash", "random"), default="hash")
+    run.add_argument("--seed", type=int, help="shuffle seed for --order random")
+    run.add_argument("--timeout", type=float, default=60.0)
     run.add_argument("--maximum-steps", type=int, default=100_000)
     run.add_argument("--maximum-alias-cases", type=int, default=4096)
+    run.add_argument(
+        "--function-timeout", type=float, default=60.0,
+        help="verification budget per function across all alias cases",
+    )
+    run.add_argument(
+        "--worker-timeout", type=float,
+        help="hard kill per function (default: function timeout plus 120 s for "
+             "extraction and a solver query that overruns the budget)",
+    )
     run.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
     args.repository = args.repository.resolve()
@@ -514,6 +611,11 @@ def main() -> int:
                          indent=2, sort_keys=True))
         return 0
     args.results = (args.results or args.output / "results.tsv").resolve()
+    if args.worker_timeout is None:
+        args.worker_timeout = args.function_timeout + 120.0
+    if args.order == "random" and args.seed is None:
+        args.seed = random.SystemRandom().randrange(1 << 32)
+        print(json.dumps({"seed": args.seed}), flush=True)
     return run_campaign(args)
 
 

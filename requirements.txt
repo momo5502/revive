@@ -2,4 +2,5 @@ angr==9.3.4
 capstone==5.0.9
 claripy==9.3.4
 pyvex==9.3.4
+unicorn==2.1.4
 z3-solver==4.13.0.0

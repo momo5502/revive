@@ -248,72 +248,138 @@ The initial campaign had high `EXTRACTION_FAILED`, `MODEL_INCOMPLETE`,
 - streamed alias scenarios and tighter global eligibility after memory growth;
 - a five-minute default timeout.
 
-The self-contained suite had 26 passing tests after these changes. Re-run it
-before relying on this handoff because the final live campaign was cancelled
-before a fresh end-to-end baseline was established.
+The self-contained suite had 26 passing tests after these changes.
+
+## Review fixes (2026-09-26, second session)
+
+A code review found several ways the prototype could report `EQUIVALENT` for
+different behavior, plus gaps that blocked common function shapes. Each
+confirmed defect has a regression test in `ReviewRegressionTests`
+(`prototype/test_hardening.py`; 49 tests pass). Fixed:
+
+- **External call effects.** A call may read and write every private stack
+  region that has escaped so far (through any argument, register argument, or
+  a pointer stored inside escaped memory), not only `pointee_size` bytes at
+  typed pointer arguments. Calls clobber ECX/EDX.
+- **Escaped stack extents.** Frame locals from both PDBs (`S_BPREL32`, EBP
+  frames) become logical allocations matched by name, giving exact extents and
+  identities. Other escapes use a conservative extent (pointer to frame end);
+  differences there are reported as `MODEL_INCOMPLETE`
+  (`ESCAPED_STACK_EXTENT_UNKNOWN`), never as proof.
+- **Uncertain observables.** Values whose observability depends on an unknown
+  contract (indirect-call ECX/EDX, guessed escape extents, ambiguous parameter
+  homes) are compared in a second pass; a possible difference yields
+  `MODEL_INCOMPLETE`.
+- **Caller frame.** Only the frame, return address and incoming argument slots
+  are private; writes above them are external.
+- **Alias model.** Pointers may lie inside another pointee or inside a
+  referenced global, at PDB layout offsets (fields, bases, array elements) or
+  every aligned offset when types are unknown. Fresh allocations moved to
+  `0x40000000`. `maximum_cases` was silently ignored and is now enforced.
+- **Custom calling conventions.** MSVC gives TU-local functions register
+  conventions their procedure type does not describe, and the reference and
+  candidate may choose different ones (e.g. reference EDX/ECX, candidate
+  ECX/EAX). Entry homes are recovered per side from each PDB's parameter
+  records and used for both the function under test and its callees. A
+  candidate whose declared parameters differ is `NOT_EQUIVALENT`
+  (`CANDIDATE_SIGNATURE_MISMATCH`).
+- **x87.** FSIN, FCOS, FSINCOS, FPTAN, FPATAN, F2XM1, FYL2X, FYL2XP1, FSCALE and
+  FSQRT are uninterpreted pure operations with functional-consistency
+  (Ackermann) constraints, independent of order. FSINCOS was the live
+  `fx_draw` `Iop_SinF64` failure (inline asm in `FX_GenSpriteVerts`). FPREM,
+  FXAM, FXTRACT, BCD and FPU-environment save/restore are `UNSUPPORTED`.
+  `__ftol2_sse` pops ST0 and `__CIsqrt` replaces it. Stale C0-C3 flags are no
+  longer compared; TOP is compared modulo 8.
+- **`int3`** (`__debugbreak`) is an ordered event followed by continuation.
+- **Jump tables.** The function's own bytes are readable; region discovery no
+  longer overwrites in-function tables with symbolic data.
+- **Frontend.** Simple float/double detection no longer matches record type
+  indices ending in 0x40/0x41. PDB-absent callees are only given an ABI when C
+  decoration or every call site fixes it. Literal lookup is limited to whole
+  strings in read-only sections. TLS constants moved out of the synthetic
+  constant range. Internal-call detection uses each side's own length. An
+  equivalence that rests on a data identity copied from the reference
+  (`reference_address_hint`) is `MODEL_INCOMPLETE` (`BORROWED_DATA_IDENTITY`).
+- **Campaign.** One driver handles every function. Verifier exceptions are
+  `INCONCLUSIVE` (`VERIFIER_ERROR`, `SOLVER_LIMIT`), not `EXTRACTION_FAILED`.
+  `--worker-timeout` (default 7200 s) kills a stuck worker. Fingerprints cover
+  `campaign.py`, the matcher, the reviewed RVA maps and the target EXE/PDB.
+  Implicitly locked `xchg [mem]` is rejected as atomic.
+
+`unicorn==2.1.4` is now pinned so angr's native library loads; the
+`UNICORN` state option is not enabled. Before enabling it, confirm that the
+`mem_read`/`mem_write` inspection breakpoints still fire for code it runs.
+
+- **Lazy global memory.** Mutable globals are no longer declared. A named
+  global resolves to the same address on both sides, so each touched byte is
+  a symbol named by address and call epoch (`lazy_<addr>_<epoch>`), shared by
+  both executions. Written bytes are compared at every call and at exit; an
+  external call starts a new epoch. Only constants with known contents are
+  declared. Declaring whole objects (the 1 MB `cgArray`) exhausted memory.
+- **Deterministic pointer handling.** angr's fallback concretization picked an
+  arbitrary solver model for an unbounded symbolic address and constrained the
+  path to it, so verdicts changed between runs. Such accesses now report
+  `MODEL_INCOMPLETE` (`UNMODELED_POINTER_ACCESS`).
+- **Performance.** Parsed PDB type databases are pickled under `.cache/`
+  (keyed by PDB path, size and mtime); candidate procedures are indexed once
+  with plain path normalization. Setup fell from about 81 s to about 6 s per
+  function. Stack-pointer classification uses a structural check before Z3,
+  and access checks reuse one solver per path; the one proved sample function
+  went from 179 s to 11 s. Access logs are linked lists. The alias driver
+  stops at the first `INCONCLUSIVE` case.
+- **Campaign.** Uses every logical CPU by default. `--memory-limit` (8 GiB)
+  kills a worker above it (`MEMORY_LIMIT`) and delays new workers until that
+  much memory is free. `--function-timeout` (default 60 s) is one budget for
+  all alias cases; `--worker-timeout` defaults to that plus 120 s.
+  `--order random --seed N` samples reproducibly.
+
+Sample, 20 random inexact functions (seed 1246938500), 12 workers, 60 s per
+function, 3.5 minutes wall clock: 1 `EQUIVALENT`, 4 `NOT_EQUIVALENT`
+(signature mismatches, assert `__FILE__`/`__LINE__` arguments, a raw instead
+of normalized `bool` return, a literal read through a mutable pointer global;
+each checked against the disassembly), 3 `MODEL_INCOMPLETE`, 11
+`INCONCLUSIVE` (budget, loops, recursion), 1 `UNSUPPORTED`. Open engine
+errors from that sample: an IR decode error in an `fx_marks` function and a
+"no bytes in memory" jump in `CL_GetLocalClientMigrationString`.
 
 ## Known issues and open work
 
-1. **`FSIN`/`Iop_SinF64` remains suspect in live code.** The unit test for raw
-   `D9 FE` passes, but the last live `fx_draw` result still reached PyVEX's
-   unsupported `Iop_SinF64`. The byte-scan hook may not cover an alternate
-   address/base, lifted block shape, or execution path. Reproduce and fix this
-   before another campaign.
-
-2. **Candidate-less corpus filtering is not actually implemented.** The split
-   command has no build argument and currently only subtracts exact ledgers.
-   Missing top-level candidate objects are discovered during classification and
-   reported as `UNSUPPORTED:MISSING_CANDIDATE_OBJECT`. Change split/run setup to
-   filter these entries explicitly; missing functions are not useful proof
-   candidates.
-
-3. **Alias-to-global eligibility uses equal byte size.** Carry canonical PDB
-   type identity and compatibility into `GlobalObject` and `PointerGlobal` so
-   unrelated equal-sized types cannot alias while valid subobjects can.
-
-4. **Indirect-call ABI recovery is heuristic.** Replace backward push scanning
-   with PDB type/callsite information or a small data-flow analysis. COM/vtable
-   calls and calls through globals need robust argument and cleanup handling.
-
-5. **External memory havoc is broad.** It is sound but expensive. Compute a
-   relevant-memory slice per call without weakening observability.
-
-6. **Project/PDB extraction is repeatedly rebuilt.** Cache PDB type databases,
-   inventory, PE parsing, relocated functions, Capstone results, and where safe
-   angr projects. Keep worker isolation in mind when choosing cache ownership.
-
-7. **Loops and nontermination are bounded.** A timeout or step limit is
-   inconclusive. No induction proof exists in this prototype.
-
-8. **Exceptions, synchronous faults, and atomics are not modeled.** SEH-chain
-   access, trap instructions, and lock-prefixed atomics are rejected.
-
-9. **Jump tables need semantic validation.** Table bytes and layout may differ;
-   dispatch behavior should be compared. Embedded table bytes can also confuse
-   linear disassembly, so executed-code discovery must not rely solely on it.
-
-10. **Proof records are implemented but campaign persistence is TSV-centric.**
-    Decide whether per-function `ProofRecord` JSON files or the TSV fingerprint
-    are the long-term near-exact ledger format.
-
-11. **Current implementation is a prototype.** The trust argument is weaker
-    than the planned Remill/LLVM/Alive2 pipeline. A reliable large campaign is
-    needed before deciding whether to harden this route or return to the native
-    lifting design.
+1. **Pointers not rooted in arguments or globals.** Memory reached through a
+   pointer loaded from memory or returned by a call (`this->a->b`, `T**`) is
+   reported `MODEL_INCOMPLETE` (`UNMODELED_POINTER_ACCESS`). Lazy allocation of such
+   pointees with their own alias cases is the largest remaining coverage gap.
+2. **Straddling overlaps.** Alias groups place members inside the largest
+   pointee; partial overlaps where neither object contains the other (e.g.
+   `vec3` pointers into one float array at non-multiple offsets) are not
+   enumerated. Typed placement also follows C++ layout, not arbitrary punning.
+3. **Large-array placements.** A pointer that may point into a large global
+   array yields one case per element and can hit the case limit.
+4. **Indirect calls** still infer stack arguments from nearby pushes and do
+   not model x87/EDX:EAX returns.
+5. **Recursion** runs the body again instead of treating the self-call as an
+   ordered event, so recursive functions time out.
+6. **Struct returns** through a hidden pointer are not modeled.
+7. **x87 precision.** VEX evaluates x87 in 64-bit double precision and ignores
+   precision control; extended-precision intermediates are not modeled.
+8. **Parameter homes** rely on VC8 emitting parameter records first and in
+   order, and assume a standard prologue for candidate callees.
+9. **Candidate-less corpus filtering** is still not implemented in `split`.
+10. **Budget-bound functions.** Most non-proofs exhaust the 60 s budget in
+    exploration (loops, recursion, large functions).
+11. **Performance.** Escape havoc and snapshots are per 4-byte chunk; bounded
+    tables above 1024 entries are rejected as unmodeled.
+12. **Loops/nontermination** remain bounded; SEH, faults and atomics are not
+    modeled.
+13. **Proof-record format** (TSV fingerprint vs per-function JSON) is undecided.
 
 ## Recommended next sequence
 
-1. Run `prototype/test_hardening.py -v` and preserve a clean baseline.
-2. Reproduce the live `fx_draw` `Iop_SinF64` escape and fix the semantic hook.
-3. Implement candidate-body corpus filtering using the build tree.
-4. Run a clean deterministic sample of 20–40 functions with `--jobs 2` while
-   the development machine is loaded; inspect every non-success reason.
-5. Add a regression for each surfaced bug before changing the campaign model.
-6. Improve PDB type-aware alias compatibility, then sample pointer-heavy
-   functions specifically.
-7. Only after statuses are reliable, regenerate the full 6,889-function corpus
-   and run it on the high-memory/high-core machine.
-8. Record only fingerprint-valid `EQUIVALENT` results as near exact.
+1. Run `prototype/test_hardening.py -v`.
+2. Investigate the open engine errors from the latest sample.
+3. Implement lazy pointee allocation (item 1), then sample pointer-heavy
+   functions.
+4. Only after statuses are reliable, run the full corpus on the large machine.
+5. Record only fingerprint-valid `EQUIVALENT` results as near exact.
 
 ## Notes for a future Remill/Alive2 implementation
 
