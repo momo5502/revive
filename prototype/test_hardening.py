@@ -212,7 +212,8 @@ class HardeningTests(unittest.TestCase):
         value = claripy.BVS("unconstrained_pointer", 32, explicit_name=True)
         result = verify_equivalence(execute(code, (value,)), execute(code, (value,)), (value,))
         self.assertEqual(VerificationStatus.MODEL_INCOMPLETE, result.status)
-        self.assertIn("UNMODELED_POINTER_ACCESS", result.reasons)
+        self.assertTrue(any(reason.startswith("UNMODELED_POINTER_ACCESS")
+                            for reason in result.reasons))
 
     def test_bounded_symbolic_table_range_is_discovered(self) -> None:
         index = claripy.BVS("bounded_index", 32, explicit_name=True)
@@ -873,6 +874,86 @@ class ReviewRegressionTests(unittest.TestCase):
         )
         self.assertEqual(VerificationStatus.INCONCLUSIVE, result.status)
         self.assertIn("SOLVER_TIMEOUT", result.reasons)
+
+    def test_alignment_in_memory_address_retains_real_base_bits(self) -> None:
+        pointer = ABIType(0x1002, "char *", 4, "pointer", pointee_size=1)
+        signature = ABISignature(0, "NearC", self.INT, (pointer,))
+        # Read *(p & ~3) versus *p. Valid when p is interior to a byte array.
+        result = verify_under_pdb_aliasing(
+            bytes.fromhex("8b442404 83e0fc 0fb600 c3"),
+            bytes.fromhex("8b442404 0fb600 c3"), signature,
+        )
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_external_pointer_havoc_uses_canonical_storage(self) -> None:
+        pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)
+        signature = ABISignature(0, "NearC", self.INT, (pointer,))
+        target = BASE + 0x200
+        call = CallTarget(target, "?modify@@YAXPAH@Z", 1,
+                          signature=ABISignature(0, "NearC", self.VOID, (pointer,)))
+        result_value = claripy.BVS("canonical_call", 32, explicit_name=True)
+        # *p = 0; modify(p); return *p; versus return 0.
+        head = bytes.fromhex("56 8b742408 c70600000000 56 e8")
+        head += rel32(BASE + len(head) - 1, target)
+        reference = head + bytes.fromhex("83c404 8b06 5e c3")
+        candidate = head + bytes.fromhex("83c404 31c0 5e c3")
+        options = dict(reference_calls=(call,), candidate_calls=(call,),
+                       call_results=(result_value,))
+        same = verify_under_pdb_aliasing(reference, reference, signature, **options)
+        self.assertEqual(VerificationStatus.EQUIVALENT, same.status, same.reasons)
+        different = verify_under_pdb_aliasing(reference, candidate, signature, **options)
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, different.status, different.reasons)
+
+    def test_cross_slot_access_cannot_borrow_another_objects_extent(self) -> None:
+        pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)
+        signature = ABISignature(0, "NearC", self.INT, (pointer, pointer))
+        # if (!p || !q || p == q) return 0;
+        # p[16384] = 1; return *q; versus return 1.
+        head = bytes.fromhex(
+            "8b4c2404 8b542408 85c9 7400 85d2 7400 39d1 7400 c7810000010001000000")
+
+        def body(tail):
+            code = bytearray(head + bytes.fromhex(tail + " c3"))
+            zero = len(code)
+            code += bytes.fromhex("31c0 c3")
+            for index in (11, 15, 19):
+                code[index] = zero - index - 1
+            return bytes(code)
+
+        result = verify_under_pdb_aliasing(body("8b02"), body("b801000000"), signature)
+        self.assertEqual(VerificationStatus.MODEL_INCOMPLETE, result.status, result.reasons)
+
+    def test_bytewise_stack_pointer_publication_escapes(self) -> None:
+        target = BASE + 0x200
+        call = CallTarget(target, "?poke@@YAXXZ", 0,
+                          signature=ABISignature(0, "NearC", self.VOID, ()))
+        result_value = claripy.BVS("bytewise_publish", 32, explicit_name=True)
+        # Publish &x as four separate byte stores, as in a bytewise copy.
+        head = bytes.fromhex(
+            "83ec04 c7042400000000 8d0424 a200002000 c1e808 "
+            "a201002000 c1e808 a202002000 c1e808 a203002000 e8")
+        head += rel32(BASE + len(head) - 1, target)
+        reference = head + bytes.fromhex("8b0424 83c404 c3")
+        candidate = head + bytes.fromhex("31c0 90 83c404 c3")
+        allocations = (LogicalAllocation("x", STACK_BASE - 4, 4),)
+        left = execute(reference, (), (call,), (result_value,), stack_allocations=allocations)
+        right = execute(candidate, (), (call,), (result_value,), stack_allocations=allocations)
+        self.assertTrue(left.states[0].globals["escaped"])
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT,
+                         verify_equivalence(left, right, ()).status)
+
+    def test_path_pruning_preserves_different_branch_layouts_and_witnesses(self) -> None:
+        signature = ABISignature(0, "NearC", self.INT, (self.INT,))
+        x = claripy.BVS("pruning_input", 32, explicit_name=True)
+        reference = bytes.fromhex("8b442404 85c0 7406 b807000000 c3 b809000000 c3")
+        candidate = bytes.fromhex("8b442404 83f800 7506 b809000000 c3 b807000000 c3")
+        wrong = bytes.fromhex("8b442404 83f800 7506 b809000000 c3 b808000000 c3")
+        lhs = execute(reference, (x,), signature=signature)
+        same = verify_equivalence(lhs, execute(candidate, (x,), signature=signature), (x,))
+        different = verify_equivalence(lhs, execute(wrong, (x,), signature=signature), (x,))
+        self.assertEqual(VerificationStatus.EQUIVALENT, same.status, same.reasons)
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, different.status, different.reasons)
+        self.assertNotEqual(0, different.counterexample[0])
 
     def test_alias_case_limit_is_enforced(self) -> None:
         pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)

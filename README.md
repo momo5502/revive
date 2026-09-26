@@ -116,3 +116,23 @@ git-ignored.
 - `SOLVER_CRASH`: the isolated worker terminated without returning a result.
 
 Only `EXACT_NOW` and `EQUIVALENT` are positive classifications.
+
+## Measure performance
+
+Benchmark particular selectors without modifying campaign results:
+
+```powershell
+.venv\Scripts\python.exe prototype\benchmark.py `
+  --repository C:\path\to\reconstruction `
+  --build C:\path\to\reconstruction\build `
+  --pdb C:\path\to\reference.pdb `
+  --exe C:\path\to\reference.exe `
+  --symbol 'decorated symbol or inventory selector' `
+  --repeat 3
+```
+
+Each measurement uses a fresh worker. `--symbol` can be repeated; `--timeout`
+sets the total function budget (default 60 seconds). JSON output includes the
+verdict, elapsed time, reasons, fingerprint, and median time per selector.
+Artifact caches may be reused. See `HANDOFF.md` for profiling results and the
+limits of the current measurements.

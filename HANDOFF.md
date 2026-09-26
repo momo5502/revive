@@ -375,6 +375,62 @@ in `CL_GetLocalClientMigrationString`.
 
 ## Known issues and open work
 
+### Fourth review fixes and performance (2026-09-26)
+
+The changes following `2234a49` fix four reproduced failures:
+
+- Memory addresses are rebased as `canonical + (actual_address - symbolic_base)`.
+  The offset retains dependence on the real base, including alignment masks;
+  replacing the base inside the whole expression was unsound.
+- Every translated access retains its originating allocation. Its offset must
+  fit that allocation's canonical storage window, even if an out-of-range
+  access would happen to land in another allocation's slot. Unsupported offsets
+  return `MODEL_INCOMPLETE` with `POINTEE_ACCESS_OUT_OF_RANGE` detail.
+- External-call havoc uses the same address translation as ordinary writes.
+  Previously it bypassed translation and rejected modeled pointer arguments as
+  unbounded addresses.
+- Publication tracking checks completed four-byte words in memory after stores,
+  including words assembled across byte/word stores or spanning store edges.
+  It now catches bytewise copies of stack addresses as well as scalar/vector
+  stores. These regions participate in subsequent external-call effects.
+
+The regression suite now has 70 passing tests. Tests include positive and
+negative pointer-call cases, alignment-dependent accesses, cross-slot accesses,
+bytewise stack-pointer publication, and changed branch layouts with a negative
+control for path pruning. The cross-slot fixture deliberately remains
+`MODEL_INCOMPLETE`; it is not accepted as equivalent.
+
+Profiling `CG_GetShellShockBlendTime` identified the final SMT comparison as
+the main bottleneck. The comparison used to include output expressions from
+every pair of terminal paths, including mutually exclusive pairs. It now
+checks overlap first, using direct contradictory conditions or an UNSAT solver
+result to discard impossible pairs. It also caches each state's lazy-memory
+snapshot and omits trivially false difference expressions. Coverage checks and
+all feasible path comparisons remain required. Solver timeouts stay inconclusive.
+
+Local measurements, using the same artifacts and existing PDB disk caches:
+
+| Version/run | Result | Function elapsed |
+| --- | --- | --- |
+| `2234a49`, no profiler, 90-second budget | `INCONCLUSIVE / SOLVER_TIMEOUT` | 90.69 s |
+| Updated, fresh worker 1, default 60-second budget | `EQUIVALENT` | 14.33 s |
+| Updated, fresh worker 2 | `EQUIVALENT` | 14.50 s |
+| Updated, fresh worker 3 | `EQUIVALENT` | 14.05 s |
+
+The updated median is 14.33 seconds. Worker startup makes total wall time
+larger than the per-function elapsed times. Profiles attributed about 64.1
+seconds to Z3 checks before the change and 2.9 seconds afterward. The initial
+profile also included cold PDB cache creation, so its extraction timings are
+not directly comparable. These are measurements of one representative function,
+not a throughput estimate for the full corpus; loop/path explosion and alias
+enumeration remain significant costs.
+
+`prototype/benchmark.py` reproduces live timing measurements in fresh isolated
+workers, with worker timeout/memory limits, and prints JSON without writing
+campaign results. Repeatable command examples are in the root README.
+
+### Remaining limitations
+
 1. **Pointer following limits.** Derived pointers are capped at 6 per
    function; pointers computed arithmetically from other loaded values are
    not derivable and stay `UNMODELED_POINTER_ACCESS`. Untyped discovered

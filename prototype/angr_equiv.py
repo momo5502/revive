@@ -21,7 +21,6 @@ import time
 import angr
 import capstone
 import claripy
-from claripy.algorithm import replace_dict
 from angr.sim_type import (
     SimTypeBottom,
     SimTypeDouble,
@@ -986,6 +985,7 @@ def execute(
     pointer_returns: dict[tuple[int, str], int] | None = None,
     pointer_layout: tuple[tuple[tuple, int, int], ...] = (),
     address_map: tuple[tuple[claripy.ast.BV, int], ...] = (),
+    allocation_stride: int = 0x10000,
 ) -> Execution:
     if frontend_issues:
         return Execution([], False, frontend_issues, constraints, (), signature, stack_allocations)
@@ -1213,12 +1213,10 @@ def execute(
     state.globals["pointer_returns"] = dict(pointer_returns or {})
     state.globals["pointer_layout"] = tuple(pointer_layout)
     # Symbolic fresh-object bases -> canonical storage addresses.
-    state.globals["address_map"] = {
-        symbol.hash(): claripy.BVV(canonical, 32) for symbol, canonical in address_map
-    }
     state.globals["address_map_names"] = frozenset(
         name for symbol, _ in address_map for name in symbol.variables
     )
+    state.globals["object_accesses"] = None
     state.memory.read_strategies = [
         angr.concretization_strategies.SimConcretizationStrategyRange(1024),
         _RejectUnboundedAddress(),
@@ -1228,23 +1226,41 @@ def execute(
         _RejectUnboundedAddress(),
     ]
 
-    def canonical_address(current: angr.SimState, address):
-        """Map an address built on symbolic object bases to its storage.
+    def canonical_address(current: angr.SimState, address, length):
+        """Rebase one object's address while preserving its actual offset.
 
-        Pointer values keep their symbolic bases (so arithmetic on them is not
-        fixed), while the bytes live at a canonical concrete address. Mapping
-        the access here, before angr concretizes, adds no path constraint.
+        Substituting the base inside an arbitrary expression changes alignment
+        and other address arithmetic. Instead retain (address - base), including
+        any dependence on the real base's bits. Never let a translated access
+        enter another object's storage window.
         """
         names = current.globals.get("address_map_names")
         if (not names or address is None or getattr(address, "concrete", True) or
                 not address.variables & names):
             return address
-        return replace_dict(address, current.globals["address_map"])
+        roots = [(symbol, canonical) for symbol, canonical in address_map
+                 if address.variables & symbol.variables]
+        size = _as_length(length)
+        if len(roots) != 1 or size is None:
+            raise UnmodeledPointerAccess("ambiguous object address or access width")
+        symbol, canonical = roots[0]
+        offset = claripy.simplify(address - symbol)
+        half = allocation_stride // 2
+        outside = claripy.Or(offset.SLT(-half), offset.SGT(half - size))
+        if (claripy.is_true(outside) or
+                (not claripy.is_false(outside) and
+                 current.solver.satisfiable(extra_constraints=(outside,)))):
+            raise UnmodeledPointerAccess("POINTEE_ACCESS_OUT_OF_RANGE")
+        mapped = claripy.BVV(canonical, 32) + offset
+        current.globals["object_accesses"] = (
+            (canonical, mapped, size), current.globals.get("object_accesses"),
+        )
+        return mapped
 
     def record_read(current: angr.SimState) -> None:
         address = current.inspect.attrs.mem_read_address
         length = current.inspect.attrs.mem_read_length
-        mapped = canonical_address(current, address)
+        mapped = canonical_address(current, address, length)
         if mapped is not address:
             current.inspect.attrs.mem_read_address = address = mapped
         if address is not None and length is not None:
@@ -1256,48 +1272,72 @@ def execute(
             )
 
     def record_write(current: angr.SimState) -> None:
-        if current.globals.get("inside_external_call", False):
-            return
         address = current.inspect.attrs.mem_write_address
         length = current.inspect.attrs.mem_write_length
-        mapped = canonical_address(current, address)
+        if length is None and current.inspect.attrs.mem_write_expr is not None:
+            length = current.inspect.attrs.mem_write_expr.size() // 8
+        mapped = canonical_address(current, address, length)
         if mapped is not address:
             current.inspect.attrs.mem_write_address = address = mapped
+        if current.globals.get("inside_external_call", False):
+            return
         if address is not None and length is not None:
             size = _as_length(length)
             if getattr(address, "concrete", False) and size is not None:
                 # Materialize first so a partial write overlays the shared value.
                 _materialize_lazy(current, address.concrete_value, size)
-            # Publishing a private stack address in external memory lets any
-            # later callee reach that object.
-            stored = current.inspect.attrs.mem_write_expr
-            low, high = _private_stack(current)
-            external = not getattr(address, "concrete", False) or not (
-                low <= address.concrete_value < high)
-            if external and stored is not None and stored.size() >= 32:
-                # Any 4-byte window of a store of any width (aggregate and
-                # vector copies included) may carry a stack address.
-                little = current.inspect.attrs.mem_write_endness != "Iend_BE"
-                width = stored.size() // 8
-                for byte in range(width - 3):
-                    if little:
-                        word = stored[8 * (byte + 4) - 1:8 * byte]
-                    else:
-                        top = stored.size() - 8 * byte
-                        word = stored[top - 1:top - 32]
-                    if not _may_address_stack(current, word):
-                        continue
-                    root = (f"store@{address.concrete_value + byte:x}"
-                            if getattr(address, "concrete", False) else f"store@symbolic+{byte}")
-                    region = _stack_escape(current, word, root)
-                    if region is not None:
-                        _add_escape(current, region)
+            elif size is not None:
+                possible = current.solver.eval_upto(address, 129)
+                if len(possible) > 128:
+                    raise UnmodeledPointerAccess("unbounded symbolic store",
+                                                 pointer_source(current, address))
+                for start in possible:
+                    _materialize_lazy(current, start, size)
             current.globals["memory_writes"] = (
                 (address, length), current.globals.get("memory_writes"),
             )
 
+    def published_pointer(current: angr.SimState) -> None:
+        if current.globals.get("inside_external_call", False):
+            return
+        address = current.inspect.attrs.mem_write_address
+        size = _as_length(current.inspect.attrs.mem_write_length)
+        if address is None or size is None or size <= 0:
+            return
+        address = canonical_address(current, address, size)
+        low, high = _private_stack(current)
+        if getattr(address, "concrete", False):
+            start = address.concrete_value
+            if low <= start and start + size <= high:
+                return
+            starts = (start,)
+        else:
+            # Enumerate the same bounded store addresses the memory engine
+            # supports; ambiguous/unbounded destinations must fail closed.
+            starts = current.solver.eval_upto(address, 129)
+            if len(starts) > 128:
+                raise UnmodeledPointerAccess("unbounded pointer publication")
+        for start in starts:
+            # Check completed pointers, including words assembled by several
+            # byte/word stores, and words crossing either edge of this store.
+            first = max(0, start - 3)
+            end = min(1 << 32, start + size + 3)
+            _materialize_lazy(current, first, end - first)
+            content = current.memory.load(
+                first, end - first, endness=current.arch.memory_endness,
+                inspect=False, disable_actions=True,
+            )
+            for byte in range(end - first - 3):
+                word = content[8 * (byte + 4) - 1:8 * byte]
+                if not _may_address_stack(current, word):
+                    continue
+                region = _stack_escape(current, word, f"store@{first + byte:x}")
+                if region is not None:
+                    _add_escape(current, region)
+
     state.inspect.b("mem_read", when=angr.BP_BEFORE, action=record_read)
     state.inspect.b("mem_write", when=angr.BP_BEFORE, action=record_write)
+    state.inspect.b("mem_write", when=angr.BP_AFTER, action=published_pointer)
     initialized_constraints = tuple(state.solver.constraints)
     manager = proj.factory.simulation_manager(state)
     started = time.monotonic()
@@ -1333,7 +1373,7 @@ def execute(
         steps += 1
         if manager.errored:
             issues.extend(
-                "UNMODELED_POINTER_ACCESS"
+                f"UNMODELED_POINTER_ACCESS:{item.error}"
                 if isinstance(item.error, UnmodeledPointerAccess) else
                 f"EXECUTION_ERROR:{type(item.error).__name__}:{item.error}"
                 for item in manager.errored[:8]
@@ -1374,10 +1414,12 @@ class _Differences:
         self.uncertain: dict[str, list[claripy.ast.Bool]] = {}
 
     def add(self, difference: claripy.ast.Bool) -> None:
-        self.definite.append(difference)
+        if not claripy.is_false(difference):
+            self.definite.append(difference)
 
     def maybe(self, kind: str, difference: claripy.ast.Bool) -> None:
-        self.uncertain.setdefault(kind, []).append(difference)
+        if not claripy.is_false(difference):
+            self.uncertain.setdefault(kind, []).append(difference)
 
 
 def _may_address_stack(state: angr.SimState, value: claripy.ast.BV) -> bool:
@@ -1785,12 +1827,32 @@ def _verify_equivalence(
             VerificationStatus.UNSUPPORTED,
             reasons=(f"UNSUPPORTED_RETURN_REGISTER:{return_register}",),
         )
-    solver = new_solver()
     mismatches: list[claripy.ast.Bool] = []
     uncertain: dict[str, list[claripy.ast.Bool]] = {}
+    # Do not feed expensive (especially floating-point) output expressions
+    # from mutually exclusive paths into the final mismatch query. Establish
+    # overlap first; pruning is permitted only after an UNSAT result.
+    paths = {id(state): path_condition(state)
+             for state in (*reference.states, *candidate.states)}
+    condition_keys = {id(state): {condition.hash() for condition in state.solver.constraints}
+                      for state in (*reference.states, *candidate.states)}
+    negated_keys = {id(state): {claripy.Not(condition).hash()
+                               for condition in state.solver.constraints}
+                    for state in candidate.states}
+    snapshots = {id(state): _lazy_snapshot(state)
+                 for state in (*reference.states, *candidate.states)}
     for lhs in reference.states:
         for rhs in candidate.states:
-            shared_path = claripy.And(path_condition(lhs), path_condition(rhs))
+            if condition_keys[id(lhs)] & negated_keys[id(rhs)]:
+                continue
+            shared_path = claripy.And(paths[id(lhs)], paths[id(rhs)])
+            if claripy.is_false(shared_path):
+                continue
+            if condition_keys[id(lhs)] != condition_keys[id(rhs)]:
+                overlap = new_solver()
+                overlap.add(claripy.And(assumptions, shared_path))
+                if not overlap.satisfiable():
+                    continue
             differences = _Differences()
             calls_differ(lhs, rhs, differences)
             # Stale x87 condition codes (C0-C3) are not part of the contract;
@@ -1819,8 +1881,8 @@ def _verify_equivalence(
                     )
             _compare_lazy(
                 differences,
-                lhs, _lazy_snapshot(lhs), lhs.globals.get("lazy_epoch", 0),
-                rhs, _lazy_snapshot(rhs), rhs.globals.get("lazy_epoch", 0),
+                lhs, snapshots[id(lhs)], lhs.globals.get("lazy_epoch", 0),
+                rhs, snapshots[id(rhs)], rhs.globals.get("lazy_epoch", 0),
             )
             for address, size in observed_memory:
                 differences.add(
@@ -1836,6 +1898,7 @@ def _verify_equivalence(
             mismatches.append(claripy.And(shared_path, _or(differences.definite)))
             for kind, values in differences.uncertain.items():
                 uncertain.setdefault(kind, []).append(claripy.And(shared_path, _or(values)))
+    solver = new_solver()
     solver.add(claripy.And(assumptions, _or(mismatches)))
     if solver.satisfiable():
         if reference.ambiguous_entry or candidate.ambiguous_entry:
@@ -2001,6 +2064,7 @@ def verify_under_pdb_aliasing(
         return {
             "pointer_slots": slots, "pointer_returns": returns, "pointer_layout": layout,
             "address_map": scenario.address_map, "constraints": scenario.constraints,
+            "allocation_stride": scenario.allocation_stride,
         }
 
     def grown_extents(scenario, executions) -> dict | str | None:
@@ -2008,8 +2072,8 @@ def verify_under_pdb_aliasing(
 
         A pointee's modeled extent (the PDB type, or a default for untyped
         discovered pointers) only bounds the alias cases; code may index past
-        it. Accesses near a canonical object that fall outside its modeled
-        range widen every member of that object (and drop its type, since it
+        it. Accesses retain their source object's identity while being rebased.
+        Those outside its modeled range widen every member (and drop its type, since it
         is evidently larger than one element). Returns the new extents, an
         issue string when an access cannot be attributed, or None.
         """
@@ -2017,12 +2081,11 @@ def verify_under_pdb_aliasing(
         if not scenario.address_map or not stride:
             return None
         arena = (ALLOCATION_BASE, ALLOCATION_LIMIT)
-        centres = [canonical for _, canonical in scenario.address_map]
         observed: dict[int, list[int]] = {}
         for execution in executions:
             for state in execution.states:
-                for kind in ("memory_reads", "memory_writes"):
-                    for address, raw_length in access_log(state, kind):
+                for kind in ("object_accesses",):
+                    for centre, address, raw_length in access_log(state, kind):
                         length = _as_length(raw_length)
                         if length is None:
                             continue
@@ -2035,11 +2098,8 @@ def verify_under_pdb_aliasing(
                                 continue
                         if high + length <= arena[0] or low >= arena[1]:
                             continue
-                        centre = next((
-                            item for item in centres
-                            if item - stride // 2 <= low and high + length <= item + stride // 2
-                        ), None)
-                        if centre is None:
+                        if not (centre - stride // 2 <= low and
+                                high + length <= centre + stride // 2):
                             return "POINTEE_ACCESS_OUT_OF_RANGE"
                         bounds = observed.setdefault(centre, [low, high + length])
                         bounds[0] = min(bounds[0], low)
