@@ -333,6 +333,21 @@ confirmed defect has a regression test in `ReviewRegressionTests`
   all alias cases; `--worker-timeout` defaults to that plus 120 s.
   `--order random --seed N` samples reproducibly.
 
+- **Pointer following.** A pointer the function loads from memory or gets
+  from a callee is discovered when an access through it is rejected. Its
+  source (a slot at a fixed address, a slot inside another entity's pointee,
+  or a call return, each per call epoch) becomes an alias-model entity typed
+  from the PDB when possible, and enumeration restarts, up to 6 derived
+  pointers (`POINTER_DEPTH_LIMIT`). Pointee contents are lazily modeled
+  memory, so nested pointers are followed the same way.
+- **Second review (five unsound EQUIVALENT paths), each with a test.**
+  Ambiguous parameter locations now receive independent values, and a
+  difference under an ambiguous ABI is `MODEL_INCOMPLETE`. A stack address
+  stored to external memory escapes. Borrowed data identities block the
+  `EXACT_NOW` path too. Untyped pointees may partially overlap (straddling
+  placements); typed ones follow the C++ object model. Out-of-range FPTAN
+  pushes nothing.
+
 Sample, 20 random inexact functions (seed 1246938500), 12 workers, 60 s per
 function, 3.5 minutes wall clock: 1 `EQUIVALENT`, 4 `NOT_EQUIVALENT`
 (signature mismatches, assert `__FILE__`/`__LINE__` arguments, a raw instead
@@ -344,14 +359,13 @@ errors from that sample: an IR decode error in an `fx_marks` function and a
 
 ## Known issues and open work
 
-1. **Pointers not rooted in arguments or globals.** Memory reached through a
-   pointer loaded from memory or returned by a call (`this->a->b`, `T**`) is
-   reported `MODEL_INCOMPLETE` (`UNMODELED_POINTER_ACCESS`). Lazy allocation of such
+1. **Pointer following limits.** Derived pointers are capped at 6 per
+   function; pointers computed arithmetically from other loaded values are
+   not derivable and stay `UNMODELED_POINTER_ACCESS`. Untyped discovered
+   pointees are assumed 64 bytes. Lazy allocation of such
    pointees with their own alias cases is the largest remaining coverage gap.
-2. **Straddling overlaps.** Alias groups place members inside the largest
-   pointee; partial overlaps where neither object contains the other (e.g.
-   `vec3` pointers into one float array at non-multiple offsets) are not
-   enumerated. Typed placement also follows C++ layout, not arbitrary punning.
+2. **Typed overlaps.** With PDB types, placements follow the C++ object
+   model (no partial overlap of distinct complete objects), not punning.
 3. **Large-array placements.** A pointer that may point into a large global
    array yields one case per element and can hit the case limit.
 4. **Indirect calls** still infer stack arguments from nearby pushes and do

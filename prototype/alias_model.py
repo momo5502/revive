@@ -41,12 +41,30 @@ class PointerGlobal:
 
 
 @dataclass(frozen=True)
+class DerivedPointer:
+    """A pointer discovered during execution rather than declared up front.
+
+    ``key`` names where the pointer value lives: ``("slot", root, offset,
+    epoch)`` for a pointer stored in memory, where ``root`` is ``("global",)``
+    (``offset`` is then an absolute address) or ``("entity", key)`` (inside
+    another entity's pointee), or ``("return", ordinal, symbol)`` for a
+    callee's return value.
+    """
+
+    key: tuple
+    pointee_size: int
+    pointee_type: int | None = None
+
+
+@dataclass(frozen=True)
 class AliasScenario:
     name: str
     arguments: tuple[claripy.ast.BV, ...]
     initial_memory: tuple[tuple[int, claripy.ast.BV], ...]
     pointer_partition: tuple[int | None, ...]
     constraints: tuple[claripy.ast.Bool, ...] = ()
+    # Every entity's pointer value, keyed ("param", index) or by derived key.
+    pointer_values: tuple[tuple[tuple, int], ...] = ()
 
 
 class AliasCaseLimit(ValueError):
@@ -108,20 +126,40 @@ def _partitions(count: int, restricted: frozenset[int]) -> Iterable[tuple[int, .
     yield from visit(0, 0)
 
 
+def straddling_offsets(outer_size: int, inner_size: int) -> tuple[int, ...]:
+    """Aligned offsets where an inner object partially overlaps an outer one
+    without being contained in it (starting before it or ending after it)."""
+    alignment = aligned_offsets(max(inner_size, 1) * 2, max(inner_size, 1))
+    step = alignment[1] - alignment[0] if len(alignment) > 1 else 1
+    return tuple(
+        offset for offset in range(-inner_size + step, outer_size, step)
+        if (offset < 0 or offset + inner_size > outer_size) and
+        offset < outer_size and offset + inner_size > 0
+    )
+
+
 def _group_layouts(members: list[int], entities: list[tuple[int, int | None]],
                    placements: Placements | None):
     """Yield (host entity, {member: offset}) for one alias group.
 
-    Every member lies inside the group's largest pointee (the host). Mutual
-    straddling overlaps between objects of which neither contains the other
-    are not enumerated.
+    Members are placed relative to the group's largest pointee (the host).
+    With PDB types for both, only layout-contained placements are used:
+    distinct complete C++ objects do not partially overlap. Without types,
+    members may also straddle the host (start before it or run past its end),
+    so partial overlaps are enumerated.
     """
     host = max(members, key=lambda member: entities[member][0])
     options = []
     for member in members:
-        offsets = (0,) if member == host else _interior_offsets(
-            placements, entities[host], entities[member],
-        )
+        if member == host:
+            offsets: tuple[int, ...] = (0,)
+        else:
+            offsets = _interior_offsets(placements, entities[host], entities[member])
+            typed = placements is not None and placements(
+                entities[host][1], entities[host][0], entities[member][1], entities[member][0],
+            ) is not None
+            if not typed:
+                offsets = (*offsets, *straddling_offsets(entities[host][0], entities[member][0]))
         if not offsets:
             return
         options.append(offsets)
@@ -140,6 +178,7 @@ def iter_alias_scenarios(
     include_null: bool = True,
     maximum_cases: int | None = None,
     placements: Placements | None = None,
+    derived: tuple[DerivedPointer, ...] = (),
 ) -> Iterable[AliasScenario]:
     pointer_positions = [index for index, value in enumerate(signature.parameters) if value.pointer]
     for index in pointer_positions:
@@ -151,15 +190,23 @@ def iter_alias_scenarios(
         (signature.parameters[position].pointee_size or 0,
          signature.parameters[position].pointee_type)
         for position in pointer_positions
-    ] + [(item.pointee_size, item.pointee_type) for item in pointer_globals]
+    ] + [(item.pointee_size, item.pointee_type) for item in pointer_globals] + [
+        (item.pointee_size, item.pointee_type) for item in derived
+    ]
+    keys = (
+        *(("param", position) for position in pointer_positions),
+        *(("pointer-global", item.address) for item in pointer_globals),
+        *(item.key for item in derived),
+    )
     restricted = frozenset(
         ordinal for ordinal, position in enumerate(pointer_positions)
         if signature.parameters[position].restrict
     )
     entity_count = len(entities)
+    # A group with a straddling member spans up to twice the largest pointee.
     allocation_stride = max(
         allocation_stride,
-        ((max((size for size, _ in entities), default=1) + 0xFFF) & ~0xFFF),
+        ((2 * max((size for size, _ in entities), default=1) + 0xFFF) & ~0xFFF),
     )
     if allocation_base + entity_count * allocation_stride > ALLOCATION_LIMIT:
         raise ValueError("fresh pointer allocations exceed the reserved address range")
@@ -209,7 +256,8 @@ def iter_alias_scenarios(
                         for chosen in product(*options):
                             scenario = _scenario(
                                 signature, pointer_positions, pointer_globals,
-                                null_mask, partition, layout, hosts, chosen,
+                                null_mask, partition, layout, hosts, chosen, keys,
+                                entities,
                             )
                             if scenario is None:
                                 continue
@@ -222,9 +270,18 @@ def iter_alias_scenarios(
 
 
 def _scenario(signature, pointer_positions, pointer_globals, null_mask, partition,
-              layout, hosts, chosen) -> AliasScenario | None:
-    bases = [address for address, _ in chosen]
-    extents = [(base, base + hosts[group][0]) for group, base in enumerate(bases)]
+              layout, hosts, chosen, keys, entities) -> AliasScenario | None:
+    bases = []
+    extents = []
+    for group, (address, owner) in enumerate(chosen):
+        offsets = layout[group][1]
+        low = min(offset for offset in offsets.values())
+        high = max(offset + entities[member][0] for member, offset in offsets.items())
+        # A fresh group starts at its slot even when a member straddles the
+        # host from below; inside a global, the host keeps its placement.
+        base = address - min(low, 0) if owner is None else address
+        bases.append(base)
+        extents.append((base + low, base + high))
     # Distinct groups are distinct, non-overlapping objects.
     if any(left[0] < right[1] and right[0] < left[1]
            for index, left in enumerate(extents) for right in extents[index + 1:]):
@@ -241,14 +298,9 @@ def _scenario(signature, pointer_positions, pointer_globals, null_mask, partitio
             arguments.append(claripy.BVS(
                 f"abi_arg_{index}", parameter.size * 8, explicit_name=True,
             ))
-    # Fresh objects get symbolic contents named by slot; globals keep theirs.
-    memory: list[tuple[int, claripy.ast.BV]] = [
-        (bases[group], claripy.BVS(
-            f"alias_object_{bases[group]:x}_{hosts[group][0]}",
-            hosts[group][0] * 8, explicit_name=True,
-        ))
-        for group in range(len(chosen)) if chosen[group][1] is None
-    ]
+    # Pointee contents are modeled lazily by address like any other memory,
+    # so pointers stored inside them can themselves be followed.
+    memory: list[tuple[int, claripy.ast.BV]] = []
     for ordinal, pointer_global in enumerate(pointer_globals, start=len(pointer_positions)):
         memory.append((pointer_global.address, claripy.BVV(pointer_values[ordinal], 32)))
     description = "null=" + "".join("1" if item else "0" for item in null_mask)
@@ -274,6 +326,7 @@ def _scenario(signature, pointer_positions, pointer_globals, null_mask, partitio
     return AliasScenario(
         description, tuple(arguments), tuple(memory),
         tuple(pointer_values[:len(pointer_positions)]),
+        pointer_values=tuple(zip(keys, pointer_values, strict=True)),
     )
 
 
@@ -287,11 +340,12 @@ def alias_scenarios(
     include_null: bool = True,
     maximum_cases: int = 4096,
     placements: Placements | None = None,
+    derived: tuple[DerivedPointer, ...] = (),
 ) -> tuple[AliasScenario, ...]:
     """Materialized compatibility wrapper used by small unit tests."""
     return tuple(iter_alias_scenarios(
         signature, globals=globals, pointer_globals=pointer_globals,
         allocation_base=allocation_base, allocation_stride=allocation_stride,
         include_null=include_null, maximum_cases=maximum_cases,
-        placements=placements,
+        placements=placements, derived=derived,
     ))

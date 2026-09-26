@@ -14,6 +14,7 @@ from enum import Enum
 import gc
 import hashlib
 import itertools
+import re
 import struct
 import time
 
@@ -82,6 +83,10 @@ class Execution:
     # Callee-owned stack: locals, the return address and incoming arguments.
     # Everything above belongs to the caller and is external memory.
     private_stack: tuple[int, int] = (STACK_LOW, STACK_BASE + 4)
+    # Some parameter had several possible entry locations.
+    ambiguous_entry: bool = False
+    # Where unmodeled pointers came from (see alias_model.DerivedPointer).
+    pointer_sources: tuple[tuple, ...] = ()
 
 
 class VerificationStatus(str, Enum):
@@ -239,6 +244,23 @@ def _materialize_lazy(state: angr.SimState, address: int, length: int) -> None:
         return
     live = state.globals.get("lazy_live", frozenset())
     epoch = state.globals.get("lazy_epoch", 0)
+    slots = state.globals.get("pointer_slots") or {}
+    if slots:
+        # A modeled pointer slot holds its case's pointer value, not bytes of
+        # an arbitrary value.
+        injected: set[int] = set()
+        for start in range(address - 3, address + length):
+            value = slots.get((start, epoch))
+            if value is None or any(start + index in live for index in range(4)):
+                continue
+            state.memory.store(
+                start, claripy.BVV(value, 32), endness=state.arch.memory_endness,
+                inspect=False, disable_actions=True,
+            )
+            injected.update(range(start, start + 4))
+        if injected:
+            live = live | frozenset(injected)
+            state.globals["lazy_live"] = live
     new = [
         byte for byte in range(address, address + length)
         if byte not in live and _lazy_byte(state, byte)
@@ -454,7 +476,10 @@ class RecordedCall(angr.SimProcedure):
         )
         for _ in range(self.x87_pops):
             x87_pop(self.state)
-        if self.fresh_result:
+        modeled = (self.state.globals.get("pointer_returns") or {}).get((ordinal, digest))
+        if modeled is not None and self.result.size() == 32:
+            result = claripy.BVV(modeled, 32)
+        elif self.fresh_result:
             result = claripy.BVS(
                 f"external_return_{ordinal}_{digest}", self.result.size(),
                 explicit_name=True,
@@ -480,7 +505,15 @@ class RecordedCall(angr.SimProcedure):
 
 
 class UnmodeledPointerAccess(angr.errors.SimMemoryAddressError):
-    """A memory access through a pointer the model does not bound."""
+    """A memory access through a pointer the model does not bound.
+
+    ``source`` identifies where the pointer came from, when derivable. It is
+    carried on the error because angr records the pre-step state.
+    """
+
+    def __init__(self, message: str, source: tuple | None = None):
+        super().__init__(message)
+        self.source = source
 
 
 class _RejectUnboundedAddress(angr.concretization_strategies.SimConcretizationStrategy):
@@ -494,7 +527,44 @@ class _RejectUnboundedAddress(angr.concretization_strategies.SimConcretizationSt
     """
 
     def _concretize(self, memory, addr, **kwargs):
-        raise UnmodeledPointerAccess(f"unbounded symbolic address {addr}")
+        raise UnmodeledPointerAccess(
+            f"unbounded symbolic address {addr}", pointer_source(memory.state, addr),
+        )
+
+
+LAZY_NAME = re.compile(r"^lazy_([0-9a-f]+)_(\d+)$")
+RETURN_NAME = re.compile(r"^external_return_(\d+)_([0-9a-f]+)$")
+
+
+def pointer_source(state: angr.SimState, address: claripy.ast.BV) -> tuple | None:
+    """Identify where the pointer inside ``address`` was loaded from.
+
+    A pointer read from lazily modeled memory is a 4-byte slot at a known
+    address and epoch; it is keyed relative to the entity whose pointee
+    contains it, or absolutely for other storage. A callee's return value is
+    keyed by call ordinal and callee. Anything else is not derivable.
+    """
+    slots: dict[int, set[int]] = {}
+    returns: set[tuple] = set()
+    for name in address.variables:
+        if match := LAZY_NAME.match(name):
+            slots.setdefault(int(match.group(2)), set()).add(int(match.group(1), 16))
+        elif match := RETURN_NAME.match(name):
+            returns.add(("return", int(match.group(1)), match.group(2)))
+    candidates = [
+        (epoch, start) for epoch, addresses in slots.items()
+        for start in addresses if all(start + index in addresses for index in range(4))
+        and start - 1 not in addresses
+    ]
+    if len(candidates) + len(returns) != 1:
+        return None
+    if returns:
+        return next(iter(returns))
+    epoch, slot = candidates[0]
+    for key, start, size in state.globals.get("pointer_layout", ()):
+        if start <= slot < start + size:
+            return ("slot", ("entity", key), slot - start, epoch)
+    return ("slot", ("global",), slot, epoch)
 
 
 def word_homes(sizes) -> tuple[ParameterHome, ...]:
@@ -636,8 +706,16 @@ def _x87_semantic(operation: str):
                 x87_store(state, 0, claripy.If(in_range, cosine, reduced_sine), tag=1)
         elif operation == "fptan":
             (tangent,) = pure_operation(state, operation, (top, rounding), (64,))
-            x87_store(state, 0, _x87_partial_trig(state, top, tangent))
-            x87_push(state, claripy.BVV(0x3FF0000000000000, 64))
+            reduced = _x87_partial_trig(state, top, tangent)
+            x87_store(state, 0, reduced)
+            # Out of range: C2 is set, the operand stays, and nothing is pushed.
+            in_range = (state.regs.fc3210 & 0x400) == 0
+            one = claripy.BVV(0x3FF0000000000000, 64)
+            if state.solver.is_true(in_range):
+                x87_push(state, one)
+            elif not state.solver.is_false(in_range):
+                state.regs.ftop = claripy.If(in_range, state.regs.ftop - 1, state.regs.ftop)
+                x87_store(state, 0, claripy.If(in_range, one, reduced), tag=1)
         elif operation in ("fpatan", "fyl2x", "fyl2xp1"):
             (result,) = pure_operation(
                 state, operation, (x87_load(state, 1), top, rounding), (64,),
@@ -903,6 +981,9 @@ def execute(
     frontend_issues: tuple[str, ...] = (),
     stack_allocations: tuple[LogicalAllocation, ...] = (),
     entry_homes: tuple[ParameterHome, ...] | None = None,
+    pointer_slots: dict[tuple[int, int], int] | None = None,
+    pointer_returns: dict[tuple[int, str], int] | None = None,
+    pointer_layout: tuple[tuple[tuple, int, int], ...] = (),
 ) -> Execution:
     if frontend_issues:
         return Execution([], False, frontend_issues, constraints, (), signature, stack_allocations)
@@ -1019,16 +1100,30 @@ def execute(
     # Place every argument in each of its entry homes. Bits a narrow value
     # does not define are shared, unconstrained garbage.
     argument_end = 4
-    for argument, home in zip(arguments, homes, strict=True):
+    ambiguous_entry = False
+    for index, (argument, home) in enumerate(zip(arguments, homes, strict=True)):
         width = argument.size()
+        # With several possible entry locations, the argument goes to the one
+        # the PDB records (the register) and every other location receives an
+        # independent value: a caller of either ABI sets only one of them.
+        # Equivalence over independent values holds for every real caller.
+        primary = home.registers[-1] if home.registers else "stack"
+        ambiguous_entry |= home.locations > 1
+
+        def value_for(location: str):
+            if location == primary:
+                return argument
+            return claripy.BVS(f"ambiguous_home_{index}_{location}", width, explicit_name=True)
+
         for register in home.registers:
-            setattr(state.regs, register, argument if width == 32 else claripy.Concat(
+            value = value_for(register)
+            setattr(state.regs, register, value if width == 32 else claripy.Concat(
                 claripy.BVS(f"incoming_{register}_upper", 32 - width, explicit_name=True),
-                argument,
+                value,
             ))
         if home.stack_offset is not None:
             address = STACK_BASE + home.stack_offset
-            state.memory.store(address, argument, endness=proj.arch.memory_endness)
+            state.memory.store(address, value_for("stack"), endness=proj.arch.memory_endness)
             slot = (width // 8 + 3) & ~3
             if slot > width // 8:
                 state.memory.store(
@@ -1112,6 +1207,9 @@ def execute(
     ))
     state.globals["lazy_live"] = frozenset()
     state.globals["lazy_epoch"] = 0
+    state.globals["pointer_slots"] = dict(pointer_slots or {})
+    state.globals["pointer_returns"] = dict(pointer_returns or {})
+    state.globals["pointer_layout"] = tuple(pointer_layout)
     state.memory.read_strategies = [
         angr.concretization_strategies.SimConcretizationStrategyRange(1024),
         _RejectUnboundedAddress(),
@@ -1142,6 +1240,18 @@ def execute(
             if getattr(address, "concrete", False) and size is not None:
                 # Materialize first so a partial write overlays the shared value.
                 _materialize_lazy(current, address.concrete_value, size)
+            # Publishing a private stack address in external memory lets any
+            # later callee reach that object.
+            stored = current.inspect.attrs.mem_write_expr
+            low, high = _private_stack(current)
+            external = not getattr(address, "concrete", False) or not (
+                low <= address.concrete_value < high)
+            if external and stored is not None and stored.size() == 32:
+                root = (f"store@{address.concrete_value:x}"
+                        if getattr(address, "concrete", False) else "store@symbolic")
+                region = _stack_escape(current, stored, root)
+                if region is not None:
+                    _add_escape(current, region)
             current.globals["memory_writes"] = (
                 (address, length), current.globals.get("memory_writes"),
             )
@@ -1200,10 +1310,14 @@ def execute(
         issues.append(f"NONRETURNING_DEADENDS:{len(manager.deadended)}")
     if not manager.returned:
         issues.append("NO_RETURNING_STATE")
+    sources = tuple(dict.fromkeys(
+        item.error.source for item in manager.errored
+        if isinstance(item.error, UnmodeledPointerAccess) and item.error.source is not None
+    ))
     return Execution(
         list(manager.returned), not issues, tuple(dict.fromkeys(issues)),
         initialized_constraints, memory_regions, signature, stack_allocations,
-        code_region, private_stack,
+        code_region, private_stack, ambiguous_entry, sources,
     )
 
 
@@ -1653,6 +1767,12 @@ def verify_equivalence(
                 uncertain.setdefault(kind, []).append(claripy.And(shared_path, _or(values)))
     solver.add(claripy.And(assumptions, _or(mismatches)))
     if solver.satisfiable():
+        if reference.ambiguous_entry or candidate.ambiguous_entry:
+            # The difference may only reflect the two sides reading different
+            # candidate locations of a parameter whose real ABI is unknown.
+            return VerificationResult(
+                VerificationStatus.MODEL_INCOMPLETE, reasons=("AMBIGUOUS_PARAMETER_HOME",),
+            )
         return VerificationResult(
             VerificationStatus.NOT_EQUIVALENT,
             tuple(solver.eval(value, 1)[0] for value in inputs),
@@ -1696,6 +1816,10 @@ def counterexample(
 
 # Executions per alias case while undeclared bounded regions keep appearing.
 DISCOVERY_ROUNDS = 6
+# Pointers discovered during execution that may become alias entities.
+MAXIMUM_DERIVED_POINTERS = 6
+# Pointee extent assumed when the PDB does not type a discovered pointer.
+DEFAULT_POINTEE_SIZE = 64
 
 
 def verify_under_pdb_aliasing(
@@ -1721,32 +1845,91 @@ def verify_under_pdb_aliasing(
     placements=None,
     reference_entry_homes: tuple[ParameterHome, ...] | None = None,
     candidate_entry_homes: tuple[ParameterHome, ...] | None = None,
+    pointer_types=None,
+    maximum_derived_pointers: int = MAXIMUM_DERIVED_POINTERS,
 ) -> VerificationResult:
     """Prove every null/alias/placement/order case admitted by PDB types.
 
     A signature without pointers yields a single fully symbolic case, so this
     is the one driver for every function. Each case executes both sides,
     declares bounded tables they index, and re-executes when needed.
-    """
-    from alias_model import AliasCaseLimit, iter_alias_scenarios
 
-    try:
-        scenarios = iter(iter_alias_scenarios(
-            signature, globals=global_objects, pointer_globals=pointer_globals,
-            maximum_cases=maximum_cases, placements=placements,
-        ))
-    except ValueError as error:
-        return VerificationResult(
-            VerificationStatus.MODEL_INCOMPLETE,
-            reasons=(f"ALIAS_MODEL_INCOMPLETE:{error}",),
-        )
+    Pointers the function loads from memory or receives from callees are
+    discovered during execution. Each becomes a further alias-model entity
+    (null, a fresh object, or aliasing a compatible object) and enumeration
+    restarts, up to ``maximum_derived_pointers``. ``pointer_types(type,
+    offset)`` returns the PDB (pointee type, pointee size) of a pointer field.
+    """
+    from alias_model import AliasCaseLimit, DerivedPointer, iter_alias_scenarios
+
     options = dict(execute_options or {})
     deadline = (
         time.monotonic() + total_timeout_seconds
         if total_timeout_seconds is not None else None
     )
+    # Pointer-valued globals are pointer slots discovered up front.
+    derived: list[DerivedPointer] = [
+        DerivedPointer(
+            ("slot", ("global",), item.address, 0), item.pointee_size,
+            getattr(item, "pointee_type", None),
+        )
+        for item in pointer_globals
+    ]
+    parameter_types = {
+        ("param", index): (parameter.pointee_type, parameter.pointee_size)
+        for index, parameter in enumerate(signature.parameters) if parameter.pointer
+    }
 
-    def run(code, calls, base, allocations, homes, arguments, memory, share):
+    def describe(source: tuple) -> DerivedPointer:
+        """Type a discovered pointer from the PDB where its origin allows."""
+        described = None
+        if source[0] == "return":
+            for call in reference_calls:
+                digest = hashlib.sha256(call.decorated_symbol.encode("utf-8")).hexdigest()[:12]
+                if digest == source[2] and call.signature and call.signature.return_type.pointer:
+                    returned = call.signature.return_type
+                    described = (returned.pointee_type, returned.pointee_size)
+        elif pointer_types is not None:
+            _, root, offset, _ = source
+            if root == ("global",):
+                owner = next((
+                    item for item in global_objects
+                    if item.address <= offset < item.address + item.size
+                ), None)
+                if owner is not None and owner.type_index is not None:
+                    described = pointer_types(owner.type_index, offset - owner.address)
+            else:
+                parent = parameter_types.get(root[1]) or next((
+                    (item.pointee_type, item.pointee_size)
+                    for item in derived if item.key == root[1]
+                ), None)
+                if parent is not None and parent[0] is not None:
+                    described = pointer_types(parent[0], offset)
+        pointee_type, pointee_size = described or (None, None)
+        return DerivedPointer(source, pointee_size or DEFAULT_POINTEE_SIZE, pointee_type)
+
+    def pointer_model(scenario):
+        values = dict(scenario.pointer_values)
+        sizes = {
+            **{key: size for key, (_, size) in parameter_types.items()},
+            **{item.key: item.pointee_size for item in derived},
+        }
+        layout = tuple(
+            (key, value, sizes[key]) for key, value in scenario.pointer_values
+            if value and key in sizes
+        )
+        slots: dict[tuple[int, int], int] = {}
+        returns: dict[tuple[int, str], int] = {}
+        for item in derived:
+            if item.key[0] == "slot":
+                _, root, offset, epoch = item.key
+                base = 0 if root == ("global",) else values.get(root[1], 0)
+                slots[(base + offset, epoch)] = values[item.key]
+            else:
+                returns[(item.key[1], item.key[2])] = values[item.key]
+        return {"pointer_slots": slots, "pointer_returns": returns, "pointer_layout": layout}
+
+    def run(code, calls, base, allocations, homes, arguments, memory, share, model):
         run_options = dict(options)
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1760,84 +1943,114 @@ def verify_under_pdb_aliasing(
         return execute(
             code, arguments, calls, call_results, memory, base=base,
             signature=signature, frontend_issues=frontend_issues,
-            stack_allocations=allocations, entry_homes=homes, **run_options,
+            stack_allocations=allocations, entry_homes=homes, **model, **run_options,
         )
 
-    incomplete: VerificationResult | None = None
-    processed_cases = 0
     while True:
+        known = {item.key for item in derived}
         try:
-            scenario = next(scenarios)
-        except StopIteration:
-            break
-        except (AliasCaseLimit, ValueError) as error:
+            scenarios = iter(iter_alias_scenarios(
+                signature, globals=global_objects,
+                maximum_cases=maximum_cases, placements=placements,
+                derived=tuple(derived),
+            ))
+        except ValueError as error:
             return VerificationResult(
                 VerificationStatus.MODEL_INCOMPLETE,
                 reasons=(f"ALIAS_MODEL_INCOMPLETE:{error}",),
             )
-        memory = (*common_memory, *scenario.initial_memory)
-        observed = (
-            *observed_memory,
-            *((address, value.size() // 8) for address, value in scenario.initial_memory),
-        )
-        executions = None
-        for attempt in range(DISCOVERY_ROUNDS):
-            reference = run(reference_code, reference_calls, reference_base,
-                            reference_stack_allocations, reference_entry_homes,
-                            scenario.arguments, memory, 0.5)
-            candidate = run(candidate_code, candidate_calls, candidate_base,
-                            candidate_stack_allocations, candidate_entry_homes,
-                            scenario.arguments, memory, 1.0)
-            if reference is None or candidate is None:
-                return VerificationResult(
-                    VerificationStatus.INCONCLUSIVE, reasons=("ALIAS_CAMPAIGN_TIMEOUT",),
-                )
-            executions = (reference, candidate)
-            extra_regions = (
-                bounded_external_regions(executions, observed)
-                if attempt + 1 < DISCOVERY_ROUNDS else ()
-            )
-            if not extra_regions:
+        incomplete: VerificationResult | None = None
+        processed_cases = 0
+        restart = False
+        while True:
+            try:
+                scenario = next(scenarios)
+            except StopIteration:
                 break
-            # Accesses to undeclared bounded ranges (tables, and the parts of
-            # large objects a run touches) reveal finite regions; declare them
-            # as shared, observed memory and execute again until none remain.
-            # Whatever is still undeclared fails the access check.
-            memory = (*memory, *(
-                (address, claripy.BVS(
-                    f"alias_bounded_{address:x}_{size}", size * 8, explicit_name=True,
+            except (AliasCaseLimit, ValueError) as error:
+                return VerificationResult(
+                    VerificationStatus.MODEL_INCOMPLETE,
+                    reasons=(f"ALIAS_MODEL_INCOMPLETE:{error}",),
+                )
+            model = pointer_model(scenario)
+            memory = (*common_memory, *scenario.initial_memory)
+            observed = (
+                *observed_memory,
+                *((address, value.size() // 8) for address, value in scenario.initial_memory),
+            )
+            executions = None
+            for attempt in range(DISCOVERY_ROUNDS):
+                reference = run(reference_code, reference_calls, reference_base,
+                                reference_stack_allocations, reference_entry_homes,
+                                scenario.arguments, memory, 0.5, model)
+                candidate = run(candidate_code, candidate_calls, candidate_base,
+                                candidate_stack_allocations, candidate_entry_homes,
+                                scenario.arguments, memory, 1.0, model)
+                if reference is None or candidate is None:
+                    return VerificationResult(
+                        VerificationStatus.INCONCLUSIVE, reasons=("ALIAS_CAMPAIGN_TIMEOUT",),
+                    )
+                executions = (reference, candidate)
+                extra_regions = (
+                    bounded_external_regions(executions, observed)
+                    if attempt + 1 < DISCOVERY_ROUNDS else ()
+                )
+                if not extra_regions:
+                    break
+                # Accesses to undeclared bounded ranges (tables) reveal finite
+                # regions; declare them as shared, observed memory and execute
+                # again until none remain. Whatever is still undeclared fails
+                # the access check.
+                memory = (*memory, *(
+                    (address, claripy.BVS(
+                        f"alias_bounded_{address:x}_{size}", size * 8, explicit_name=True,
+                    ))
+                    for address, size in extra_regions
                 ))
-                for address, size in extra_regions
-            ))
-            observed = (*observed, *extra_regions)
-        symbolic_inputs = tuple(
-            value for value in scenario.arguments if value.symbolic
-        ) + tuple(value for _, value in scenario.initial_memory)
-        result = verify_equivalence(
-            *executions, symbolic_inputs,
-            observed_memory=observed,
-            return_pointer=signature.return_type.pointer,
-        )
-        if result.status == VerificationStatus.NOT_EQUIVALENT:
-            return VerificationResult(
-                result.status, result.counterexample,
-                (f"ALIAS_SCENARIO:{scenario.name}", *result.reasons),
+                observed = (*observed, *extra_regions)
+            discovered = [
+                source for execution in executions for source in execution.pointer_sources
+                if source not in known
+            ]
+            if discovered:
+                discovered = list(dict.fromkeys(discovered))
+                if len(derived) + len(discovered) > maximum_derived_pointers:
+                    return VerificationResult(
+                        VerificationStatus.MODEL_INCOMPLETE,
+                        reasons=(f"ALIAS_SCENARIO:{scenario.name}", "POINTER_DEPTH_LIMIT"),
+                    )
+                derived.extend(describe(source) for source in discovered)
+                restart = True
+                break
+            symbolic_inputs = tuple(
+                value for value in scenario.arguments if value.symbolic
+            ) + tuple(value for _, value in scenario.initial_memory)
+            result = verify_equivalence(
+                *executions, symbolic_inputs,
+                observed_memory=observed,
+                return_pointer=signature.return_type.pointer,
             )
-        if result.status != VerificationStatus.EQUIVALENT and incomplete is None:
-            incomplete = VerificationResult(
-                result.status, result.counterexample,
-                (f"ALIAS_SCENARIO:{scenario.name}", *result.reasons),
-            )
-        if result.status == VerificationStatus.INCONCLUSIVE:
-            # The function can no longer be proved. Later cases could only
-            # find a counterexample, and a case that exhausted its limits
-            # predicts the rest will too; stop spending the budget.
-            return incomplete
-        processed_cases += 1
-        del executions, result
-        if processed_cases % 8 == 0:
-            gc.collect()
-    return incomplete or VerificationResult(VerificationStatus.EQUIVALENT)
+            if result.status == VerificationStatus.NOT_EQUIVALENT:
+                return VerificationResult(
+                    result.status, result.counterexample,
+                    (f"ALIAS_SCENARIO:{scenario.name}", *result.reasons),
+                )
+            if result.status != VerificationStatus.EQUIVALENT and incomplete is None:
+                incomplete = VerificationResult(
+                    result.status, result.counterexample,
+                    (f"ALIAS_SCENARIO:{scenario.name}", *result.reasons),
+                )
+            if result.status == VerificationStatus.INCONCLUSIVE:
+                # The function can no longer be proved. Later cases could only
+                # find a counterexample, and a case that exhausted its limits
+                # predicts the rest will too; stop spending the budget.
+                return incomplete
+            processed_cases += 1
+            del executions, result
+            if processed_cases % 8 == 0:
+                gc.collect()
+        if not restart:
+            return incomplete or VerificationResult(VerificationStatus.EQUIVALENT)
 
 
 def rel32(instruction_address: int, target: int) -> bytes:

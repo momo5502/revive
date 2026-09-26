@@ -28,6 +28,7 @@ from live_extract import (
     external_call_contracts,
     extract,
     global_object_contracts,
+    pointer_field_types,
     pointer_global_contracts,
     stack_allocation_contracts,
     type_placements,
@@ -199,6 +200,20 @@ def _frontend_identity(paths: Paths, matcher) -> dict[str, str]:
     }
 
 
+def borrowed_identities(pair: dict) -> list[str]:
+    """Candidate data identities copied from the reference instruction.
+
+    Neither byte identity nor an equivalence proof can detect a wrong
+    reference whose target was taken from the reference itself, so no
+    success may rest on one.
+    """
+    return sorted({
+        relocation.get("target") or "?"
+        for relocation in pair["relocation_resolutions"]
+        if relocation.get("identity_rule") == "reference_address_hint"
+    })
+
+
 def _classify(item: WorkItem) -> WorkResult:
     started = time.monotonic()
 
@@ -217,7 +232,8 @@ def _classify(item: WorkItem) -> WorkResult:
         )
         signature = pair["signature"]
         frontend = _frontend_identity(item.paths, pair["matcher"])
-        if pair["reference"] == pair["candidate"]:
+        borrowed = borrowed_identities(pair)
+        if pair["reference"] == pair["candidate"] and not borrowed:
             fingerprint = proof_fingerprint(
                 symbol=item.selector,
                 reference=pair["reference"], candidate=pair["candidate"],
@@ -234,6 +250,7 @@ def _classify(item: WorkItem) -> WorkResult:
         pointer_descriptors = pointer_global_contracts(pair)
         reference_allocations, candidate_allocations = stack_allocation_contracts(pair)
         placements = type_placements(pair)
+        pointer_types = pointer_field_types(pair)
     except FileNotFoundError as error:
         return finish(VerificationStatus.UNSUPPORTED.value, None,
                       (f"MISSING_CANDIDATE_OBJECT:{error}",))
@@ -346,6 +363,7 @@ def _classify(item: WorkItem) -> WorkResult:
             placements=placements,
             reference_entry_homes=pair["reference_homes"],
             candidate_entry_homes=pair["candidate_homes"],
+            pointer_types=pointer_types,
         )
     except MemoryError as error:
         return finish(VerificationStatus.INCONCLUSIVE.value, fingerprint,
@@ -358,11 +376,6 @@ def _classify(item: WorkItem) -> WorkResult:
         return finish(VerificationStatus.INCONCLUSIVE.value, fingerprint,
                       (f"VERIFIER_ERROR:{type(error).__name__}:{error}",))
 
-    borrowed = sorted({
-        relocation.get("target") or "?"
-        for relocation in pair["relocation_resolutions"]
-        if relocation.get("identity_rule") == "reference_address_hint"
-    })
     if result.status == VerificationStatus.EQUIVALENT and borrowed:
         # The candidate's data identity was copied from the reference, so an
         # equivalence proof could not have detected a wrong reference.

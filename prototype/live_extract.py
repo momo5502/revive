@@ -725,6 +725,55 @@ def _candidate_procedure_index(pair: dict) -> dict:
     return _CANDIDATE_INDEXES[key]
 
 
+def pointer_field_types(pair: dict):
+    """Callback typing a pointer stored at ``offset`` inside a target type.
+
+    Returns (pointee type, pointee size) for a pointer field that starts at
+    that offset, following nested members, base classes and array elements,
+    or None when the layout has no pointer there.
+    """
+    matcher = pair["matcher"]
+    db = _target_type_db(pair)
+
+    def canonical(index):
+        index = matcher.strip_qualifiers(db, index)
+        return matcher.resolve_forward_ref(db, index) if index is not None and index >= 0x1000 else index
+
+    def find(index, offset):
+        index = canonical(index)
+        if index is None:
+            return None
+        if index < 0x1000:
+            base = matcher.simple_pointer_base(index)
+            if base is not None and offset == 0:
+                return base, matcher.type_size(db, base)
+            return None
+        record = db.get(index) or {}
+        kind = record.get("Kind")
+        if kind == "LF_POINTER":
+            if offset != 0:
+                return None
+            referent = (record.get("Pointer") or {}).get("ReferentType")
+            return referent, matcher.type_size(db, referent)
+        if kind == "LF_ARRAY":
+            element = record["Array"].get("ElementType")
+            element_size = matcher.type_size(db, element)
+            if not element_size:
+                return None
+            return find(element, offset % element_size)
+        if kind in matcher.CLASS_LIKE_KINDS or kind == "LF_UNION":
+            body = record["Union" if kind == "LF_UNION" else "Class"]
+            for _, member_offset, member in matcher.members_of(db, body.get("FieldList")) or ():
+                size = matcher.type_size(db, member) or 0
+                if member_offset <= offset < member_offset + size:
+                    found = find(member, offset - member_offset)
+                    if found is not None:
+                        return found
+        return None
+
+    return find
+
+
 def candidate_pdb_path(build: Path) -> Path:
     return build / "src" / "win32" / "iw4_multiplayer.pdb"
 

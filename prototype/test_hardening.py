@@ -590,8 +590,9 @@ class ReviewRegressionTests(unittest.TestCase):
         result = verify_equivalence(reference, candidate, (a, b))
         self.assertEqual(VerificationStatus.EQUIVALENT, result.status, result.reasons)
 
-    def test_ambiguous_entry_home_places_the_value_in_both(self) -> None:
-        # Whichever ABI the body uses, it observes the same parameter.
+    def test_ambiguous_entry_home_is_not_assumed_consistent(self) -> None:
+        # A caller of either ABI sets only one location. Reading the same one
+        # on both sides is equivalent; reading different ones is unknown.
         from pdb_frontend import ParameterHome
         signature = ABISignature(0, "NearC", self.INT, (self.INT,))
         a = claripy.BVS("ambiguous_a", 32, explicit_name=True)
@@ -599,8 +600,11 @@ class ReviewRegressionTests(unittest.TestCase):
         from_register = execute(bytes.fromhex("c3"), (a,), signature=signature, entry_homes=home)
         from_stack = execute(bytes.fromhex("8b442404 c3"), (a,), signature=signature,
                              entry_homes=home)
-        result = verify_equivalence(from_register, from_stack, (a,))
-        self.assertEqual(VerificationStatus.EQUIVALENT, result.status, result.reasons)
+        mixed = verify_equivalence(from_register, from_stack, (a,))
+        self.assertEqual(VerificationStatus.MODEL_INCOMPLETE, mixed.status, mixed.reasons)
+        again = execute(bytes.fromhex("90 c3"), (a,), signature=signature, entry_homes=home)
+        same = verify_equivalence(from_register, again, (a,))
+        self.assertEqual(VerificationStatus.EQUIVALENT, same.status, same.reasons)
 
     def test_standard_entry_homes_follow_the_declared_convention(self) -> None:
         from pdb_frontend import ParameterHome, standard_parameter_homes
@@ -677,6 +681,143 @@ class ReviewRegressionTests(unittest.TestCase):
             reference_calls=(call,), candidate_calls=(call,), call_results=results,
         )
         self.assertEqual(VerificationStatus.NOT_EQUIVALENT, different.status, different.reasons)
+
+    def _pointer_pair(self, reference_hex: str, candidate_hex: str, signature=None,
+                      calls=(), results=()):
+        return verify_under_pdb_aliasing(
+            bytes.fromhex(reference_hex), bytes.fromhex(candidate_hex),
+            signature or ABISignature(0, "NearC", self.INT, ()),
+            reference_calls=calls, candidate_calls=calls, call_results=results,
+        )
+
+    def test_pointer_loaded_from_a_global_is_followed(self) -> None:
+        # p = *(int **)0x200000; return p[1];   versus p[2].
+        load = "8b0d00002000"
+        same = self._pointer_pair(load + "8b4104 c3", load + "8b4104 c3")
+        self.assertEqual(VerificationStatus.EQUIVALENT, same.status, same.reasons)
+        different = self._pointer_pair(load + "8b4104 c3", load + "8b4108 c3")
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, different.status, different.reasons)
+
+    def test_pointer_field_of_a_parameter_pointee_is_followed(self) -> None:
+        # f(S *s) { return s->next->value; }  with value at +4 versus +8.
+        state = ABIType(0x1001, "S *", 4, "pointer", pointee_size=8)
+        signature = ABISignature(0, "NearC", self.INT, (state,))
+        load = "8b442404 8b00"
+        same = self._pointer_pair(load + "8b4004 c3", load + "8b4004 c3", signature)
+        self.assertEqual(VerificationStatus.EQUIVALENT, same.status, same.reasons)
+        different = self._pointer_pair(load + "8b4004 c3", load + "8b4008 c3", signature)
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, different.status, different.reasons)
+
+    def test_pointer_returned_by_a_callee_is_followed(self) -> None:
+        target = BASE + 0x200
+        call = CallTarget(target, "?get@@YAPAHXZ", 0,
+                          signature=ABISignature(0, "NearC", self.INT, ()))
+        results = (claripy.BVS("returned_pointer", 32, explicit_name=True),)
+
+        def code(offset: int) -> str:
+            return ("e8" + rel32(BASE, target).hex() + "8b40" + f"{offset:02x}" + "c3")
+
+        same = self._pointer_pair(code(4), code(4), calls=(call,), results=results)
+        self.assertEqual(VerificationStatus.EQUIVALENT, same.status, same.reasons)
+        different = self._pointer_pair(code(4), code(8), calls=(call,), results=results)
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, different.status, different.reasons)
+
+    def test_loaded_pointers_may_alias(self) -> None:
+        # a = *G1; b = *G2; *a = 1; return *b;  versus reading *b first.
+        # Only differs when both globals hold the same pointer.
+        reference = "8b0d00002000 8b1504002000 c70101000000 8b02 c3"
+        candidate = "8b0d00002000 8b1504002000 8b02 c70101000000 c3"
+        result = self._pointer_pair(reference, candidate)
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_pointer_reloaded_after_a_call_is_a_new_pointer(self) -> None:
+        # The callee may replace *G, so a pointer cached across the call differs.
+        target = BASE + 0x200
+        call = CallTarget(target, "?f@@YAXXZ", 0,
+                          signature=ABISignature(0, "NearC", self.VOID, ()))
+        results = (claripy.BVS("reload_call", 32, explicit_name=True),)
+        head = bytes.fromhex("56 8b3500002000 e8")
+        reference = (head + rel32(BASE + len(head) - 1, target) +
+                     bytes.fromhex("8b0d00002000 8b01 5e c3")).hex()
+        candidate = (head + rel32(BASE + len(head) - 1, target) +
+                     bytes.fromhex("8bce 90909090 8b01 5e c3")).hex()
+        result = self._pointer_pair(reference, candidate, calls=(call,), results=results)
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_stack_address_published_in_a_global_escapes(self) -> None:
+        # int x = 0; g = &x; poke(); return x;   versus returning 0.
+        target = BASE + 0x200
+        call = CallTarget(target, "?poke@@YAXXZ", 0,
+                          signature=ABISignature(0, "NearC", self.VOID, ()))
+        results = (claripy.BVS("publish_call", 32, explicit_name=True),)
+        head = bytes.fromhex("83ec04 c7042400000000 8d0424 a300002000 e8")
+        call_bytes = rel32(BASE + len(head) - 1, target)
+        reference = head + call_bytes + bytes.fromhex("8b0424 83c404 c3")
+        candidate = head + call_bytes + bytes.fromhex("31c0 90 83c404 c3")
+        result = verify_equivalence(
+            execute(reference, (), (call,), results), execute(candidate, (), (call,), results), (),
+        )
+        self.assertNotEqual(VerificationStatus.EQUIVALENT, result.status)
+
+    def test_borrowed_identity_blocks_byte_exact_success(self) -> None:
+        import campaign
+
+        pair = {
+            "signature": ABISignature(0, "NearC", self.INT, ()),
+            "reference": b"\xc3", "candidate": b"\xc3", "matcher": None,
+            "frontend_issues": (), "reference_homes": None, "candidate_homes": None,
+            "address": BASE,
+            "relocation_resolutions": ({"target": "_private", "identity_rule":
+                                        "reference_address_hint"},),
+        }
+        patches = {
+            "extract": lambda *_: pair,
+            "_frontend_identity": lambda *_: {},
+            "external_call_contracts": lambda *_: ((), ()),
+            "global_object_contracts": lambda *_: (),
+            "pointer_global_contracts": lambda *_: (),
+            "stack_allocation_contracts": lambda *_: ((), ()),
+            "type_placements": lambda *_: None,
+            "pointer_field_types": lambda *_: None,
+        }
+        originals = {name: getattr(campaign, name) for name in patches if hasattr(campaign, name)}
+        for name, value in patches.items():
+            setattr(campaign, name, value)
+        try:
+            paths = campaign.Paths("repository", "build", "pdb", "exe")
+            result = campaign._classify(campaign.WorkItem("f", paths, 10.0, 1000, 16))
+        finally:
+            for name in patches:
+                if name in originals:
+                    setattr(campaign, name, originals[name])
+                else:
+                    delattr(campaign, name)
+        self.assertEqual("MODEL_INCOMPLETE", result.status, result.reasons)
+        self.assertTrue(any(reason.startswith("BORROWED_DATA_IDENTITY") for reason in result.reasons))
+
+    def test_untyped_pointees_may_partially_overlap(self) -> None:
+        # f(S *p, S *q) { p->b = 1; q->a = 2; return p->b; }, sizeof(S) == 8.
+        # Only q == (char *)p + 4 distinguishes it from returning 1.
+        pair = ABIType(0x1001, "S *", 4, "pointer", pointee_size=8)
+        signature = ABISignature(0, "NearC", self.INT, (pair, pair))
+        prefix = "8b4c2404 8b542408 c7410401000000 c70202000000"
+        result = verify_under_pdb_aliasing(
+            bytes.fromhex(prefix + "8b4104 c3"),
+            bytes.fromhex(prefix + "b801000000 c3"), signature,
+        )
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
+
+    def test_out_of_range_fptan_pushes_nothing(self) -> None:
+        # FPTAN of |x| >= 2**63 leaves x on the stack; FLD1 pushes 1.0.
+        double = ABIType(0x41, "double", 8, "double")
+        signature = ABISignature(0, "NearC", double, (double,))
+        x = claripy.BVS("fptan_x", 64, explicit_name=True)
+        result = verify_equivalence(
+            execute(bytes.fromhex("dd442404 d9f2 c3"), (x,), signature=signature),
+            execute(bytes.fromhex("dd442404 d9e8 c3"), (x,), signature=signature),
+            (x,),
+        )
+        self.assertEqual(VerificationStatus.NOT_EQUIVALENT, result.status, result.reasons)
 
     def test_alias_case_limit_is_enforced(self) -> None:
         pointer = ABIType(0x1002, "int *", 4, "pointer", pointee_size=4)
